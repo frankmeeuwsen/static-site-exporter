@@ -3,26 +3,49 @@
  * Plugin Name: Static Site Exporter to Kinsta
  * Plugin URI: https://example.com
  * Description: Export WordPress site to static HTML and deploy to GitHub/Kinsta Static Hosting
- * Version: 2.0.0
+ * Version: 2.2.0
  * Author: Monique Dubbelman
  * License: GPL v2 or later
+ *
+ * Changelog:
+ * 2.2.0 - MAJOR FIX: Comprehensive URL conversion for CSS/JS/images
+ *       - Improved make_urls_relative() to handle escaped and encoded URLs
+ *       - Fixes JavaScript-escaped URLs (http:\/\/)
+ *       - Fixes URL-encoded URLs (http%3A%2F%2F)
+ *       - Fixes broken CSS, images, and responsive viewport issues
+ * 2.1.1 - CRITICAL FIX: Exclude Simply Static temp files and debug logs from export
+ *       - Added recursive_copy_with_exclusions() method
+ *       - Prevents 355MB debug file from being exported
+ *       - Reduces export size from 473MB to ~118MB
+ *       - Excludes: simply-static/, static-export/, static-export-temp/
+ * 2.1.0 - Fixed AJAX timeout issues for GitHub push with large sites
+ *       - Implemented chunked AJAX processing for GitHub uploads
+ *       - Added resumable progress tracking with transients
+ *       - Processes files in batches of 10-20 per AJAX call
+ *       - Real-time progress updates in admin interface
+ * 2.0.1 - Fixed memory exhaustion issues for large sites (473MB+)
+ *       - Improved file scanning with memory-efficient methods
+ *       - Added automatic memory limit increase to 512MB
+ *       - Added periodic garbage collection during uploads
  */
 
 if (!defined('ABSPATH')) exit;
 
 class WP_Static_Exporter {
     // Configuration constants
-    const BATCH_SIZE = 50;              // Files per GitHub batch
+    const BATCH_SIZE = 50;              // Files per GitHub batch (LEGACY - kept for backward compatibility)
+    const CHUNK_SIZE = 15;              // Files per AJAX chunk (new chunked processing)
     const MAX_FILE_SIZE = 10485760;     // 10MB in bytes
     const MAX_EXPORT_SIZE = 524288000;  // 500MB in bytes
     const GITHUB_TREE_LIMIT = 5000;     // GitHub tree item limit
     const API_TIMEOUT = 60;             // API timeout in seconds
     const PAGE_TIMEOUT = 30;            // Page fetch timeout
-    const BATCH_DELAY = 2;              // Seconds between batches
+    const BATCH_DELAY = 1;              // Seconds between batches (reduced from 2)
     const MAX_RETRIES = 3;              // API retry attempts
     const LOG_MAX_SIZE = 102400;        // 100KB max log size
     const DEBOUNCE_TIME = 120;          // 2 minutes
     const SCHEDULE_DELAY = 30;          // 30 seconds
+    const CHUNK_TIMEOUT = 45;           // Timeout for chunked AJAX requests (seconds)
 
     private $export_dir;
     private $temp_dir;
@@ -39,6 +62,12 @@ class WP_Static_Exporter {
         add_action('wp_ajax_push_to_github', array($this, 'ajax_push_to_github'));
         add_action('wp_ajax_deploy_to_kinsta', array($this, 'ajax_deploy_to_kinsta'));
         add_action('wp_ajax_get_export_log', array($this, 'ajax_get_export_log'));
+
+        // New chunked GitHub push endpoints
+        add_action('wp_ajax_github_push_init', array($this, 'ajax_github_push_init'));
+        add_action('wp_ajax_github_push_chunk', array($this, 'ajax_github_push_chunk'));
+        add_action('wp_ajax_github_push_finalize', array($this, 'ajax_github_push_finalize'));
+        add_action('wp_ajax_github_push_status', array($this, 'ajax_github_push_status'));
 
         // Auto-export triggers
         $this->setup_auto_export_hooks();
@@ -444,23 +473,48 @@ class WP_Static_Exporter {
 
     /**
      * Get directory size in bytes
+     * Uses disk_usage command for efficiency to avoid memory issues with large directories
      */
     private function get_directory_size($path) {
         if (!is_dir($path)) return 0;
 
+        // Try using system command first (more memory efficient)
+        if (function_exists('exec')) {
+            $output = array();
+            $return_var = 0;
+            @exec('du -sk ' . escapeshellarg($path) . ' 2>/dev/null', $output, $return_var);
+
+            if ($return_var === 0 && !empty($output[0])) {
+                // du -sk returns size in kilobytes
+                $size_kb = (int) $output[0];
+                return $size_kb * 1024; // Convert to bytes
+            }
+        }
+
+        // Fallback to PHP method with memory optimization
         $size = 0;
         try {
             $iterator = new RecursiveIteratorIterator(
-                new RecursiveDirectoryIterator($path, RecursiveDirectoryIterator::SKIP_DOTS)
+                new RecursiveDirectoryIterator($path, RecursiveDirectoryIterator::SKIP_DOTS),
+                RecursiveIteratorIterator::LEAVES_ONLY
             );
 
             foreach ($iterator as $file) {
                 if ($file->isFile()) {
                     $size += $file->getSize();
                 }
+
+                // Prevent memory exhaustion - if we're checking a very large directory,
+                // stop counting after a reasonable threshold and return estimate
+                if ($size > self::MAX_EXPORT_SIZE * 2) {
+                    $this->log('Warning: Directory is very large, size check stopped early');
+                    return $size;
+                }
             }
         } catch (Exception $e) {
-            $this->log('Warning: Could not calculate size for ' . $path);
+            $this->log('Warning: Could not calculate size for ' . $path . ': ' . $e->getMessage());
+            // Return 0 so pre-flight check doesn't fail, just warns
+            return 0;
         }
 
         return $size;
@@ -568,6 +622,12 @@ class WP_Static_Exporter {
             wp_mkdir_p($this->export_dir);
             wp_mkdir_p($this->temp_dir);
 
+            // Close session to prevent blocking when fetching pages
+            // This allows wp_remote_get() to fetch pages from the same site
+            if (session_id()) {
+                session_write_close();
+            }
+
             // Export homepage
             $this->export_page(home_url('/'), 'index.html');
 
@@ -672,11 +732,43 @@ class WP_Static_Exporter {
         $site_url = get_site_url();
         $home_url = get_home_url();
 
-        // Replace absolute URLs with relative
-        $html = str_replace($site_url, '', $html);
-        $html = str_replace($home_url, '', $html);
+        // Build different variations of the URL to replace
+        $urls_to_replace = array($site_url, $home_url);
+
+        // Add variations with trailing slash
+        if (!str_ends_with($site_url, '/')) {
+            $urls_to_replace[] = $site_url . '/';
+        }
+        if (!str_ends_with($home_url, '/')) {
+            $urls_to_replace[] = $home_url . '/';
+        }
+
+        foreach ($urls_to_replace as $url) {
+            // 1. Replace JavaScript-escaped URLs first (e.g., http:\/\/modub.local\/ → \/)
+            $escaped_url = str_replace('/', '\/', $url);
+            $html = str_replace($escaped_url, '', $html);
+
+            // 2. Replace URL-encoded URLs (e.g., http%3A%2F%2Fmodub.local%2F)
+            $encoded_url = urlencode($url);
+            $html = str_replace($encoded_url, '', $html);
+
+            // 3. Replace normal URLs
+            $html = str_replace($url, '', $html);
+        }
+
+        // Fix protocol-relative URLs (// should become https://)
         $html = str_replace('href="//', 'href="https://', $html);
         $html = str_replace('src="//', 'src="https://', $html);
+        $html = str_replace('url("//', 'url("https://', $html);
+
+        // Clean up any remaining issues
+        // Fix empty href/src that point to root
+        $html = str_replace('href=""', 'href="/"', $html);
+        $html = str_replace('src=""', 'src="/"', $html);
+
+        // Fix standalone backslash-escaped slashes in JSON
+        $html = str_replace('"\/"', '"/"', $html);
+        $html = str_replace('":"\/"', '":"/"', $html);
 
         return $html;
     }
@@ -684,13 +776,18 @@ class WP_Static_Exporter {
     private function copy_assets() {
         $this->log('Copying assets...');
 
-        // Copy wp-content/uploads
+        // Copy wp-content/uploads (excluding Simply Static temp files and debug logs)
         $uploads_dir = wp_upload_dir();
         $source = $uploads_dir['basedir'];
         $dest = $this->export_dir . '/wp-content/uploads';
 
         if (file_exists($source)) {
-            $this->recursive_copy($source, $dest);
+            // FIX v2.1.1: Exclude simply-static directory to prevent debug files from being exported
+            $this->recursive_copy_with_exclusions($source, $dest, array(
+                'simply-static', // Exclude Simply Static temp files and debug logs
+                'static-export', // Exclude our own export directory if nested
+                'static-export-temp' // Exclude our temp directory
+            ));
         }
 
         // Copy theme assets
@@ -699,6 +796,39 @@ class WP_Static_Exporter {
         $this->recursive_copy($theme_dir, $theme_dest);
     }
 
+    /**
+     * Recursive copy with exclusions (v2.1.1)
+     * Prevents copying unwanted directories like Simply Static temp files
+     */
+    private function recursive_copy_with_exclusions($src, $dst, $exclusions = array()) {
+        if (!file_exists($src)) return;
+
+        $dir = opendir($src);
+        wp_mkdir_p($dst);
+
+        while (($file = readdir($dir)) !== false) {
+            if ($file != '.' && $file != '..') {
+                // Check if file/directory should be excluded
+                if (in_array($file, $exclusions)) {
+                    $this->log("Excluding directory: $file");
+                    continue;
+                }
+
+                if (is_dir($src . '/' . $file)) {
+                    $this->recursive_copy_with_exclusions($src . '/' . $file, $dst . '/' . $file, $exclusions);
+                } else {
+                    copy($src . '/' . $file, $dst . '/' . $file);
+                }
+            }
+        }
+
+        closedir($dir);
+    }
+
+    /**
+     * Original recursive copy without exclusions
+     * Kept for backward compatibility (used for theme assets)
+     */
     private function recursive_copy($src, $dst) {
         if (!file_exists($src)) return;
 
@@ -728,7 +858,11 @@ class WP_Static_Exporter {
         file_put_contents($this->export_dir . '/.gitignore', $gitignore);
     }
 
-    public function ajax_push_to_github() {
+    /**
+     * NEW CHUNKED GITHUB PUSH - Initialize the push process
+     * This replaces the single long AJAX call with multiple short calls
+     */
+    public function ajax_github_push_init() {
         check_ajax_referer('static_exporter_nonce', 'nonce');
 
         if (!current_user_can('manage_options')) {
@@ -741,22 +875,390 @@ class WP_Static_Exporter {
         $branch = $options['github_branch'] ?? 'main';
 
         if (empty($token) || empty($repo)) {
-            wp_send_json_error('GitHub settings not configured. Please save your GitHub token and repository in the settings above.');
+            wp_send_json_error('GitHub settings not configured.');
         }
-
-        $this->log('Pushing to GitHub...');
-
-        // Increase execution time for large sites
-        set_time_limit(600);
 
         try {
-            $this->push_to_github_api($token, $repo, $branch);
-            $this->log('Successfully pushed to GitHub!');
-            wp_send_json_success(array('message' => 'Pushed to GitHub'));
+            $this->log('Initializing GitHub push...');
+
+            // Verify credentials
+            $user_response = $this->api_request_with_retry("https://api.github.com/user", array(
+                'headers' => array(
+                    'Authorization' => 'Bearer ' . $token,
+                    'User-Agent' => 'WordPress-Static-Exporter',
+                    'Accept' => 'application/vnd.github.v3+json'
+                ),
+                'timeout' => self::API_TIMEOUT,
+                'sslverify' => true
+            ), 'GitHub authentication');
+
+            $user_code = wp_remote_retrieve_response_code($user_response);
+            if ($user_code !== 200) {
+                throw new Exception('Invalid GitHub token');
+            }
+
+            // Get current commit SHA
+            $ref_response = $this->api_request_with_retry("https://api.github.com/repos/$repo/git/refs/heads/$branch", array(
+                'headers' => array(
+                    'Authorization' => 'Bearer ' . $token,
+                    'User-Agent' => 'WordPress-Static-Exporter',
+                    'Accept' => 'application/vnd.github.v3+json'
+                ),
+                'timeout' => self::API_TIMEOUT,
+                'sslverify' => true
+            ), 'Get branch reference');
+
+            $response_code = wp_remote_retrieve_response_code($ref_response);
+            if ($response_code !== 200) {
+                throw new Exception('Repository or branch not found');
+            }
+
+            $ref_data = json_decode(wp_remote_retrieve_body($ref_response), true);
+            $current_commit_sha = $ref_data['object']['sha'] ?? null;
+
+            if (!$current_commit_sha) {
+                throw new Exception('Could not find current commit SHA');
+            }
+
+            // Get all files
+            $files = $this->get_all_files_efficient($this->export_dir);
+            $total_files = count($files);
+
+            $this->log("Found $total_files files to upload");
+
+            if ($total_files >= self::GITHUB_TREE_LIMIT) {
+                throw new Exception(sprintf(
+                    'Site has %d files, exceeds GitHub limit of %d',
+                    $total_files,
+                    self::GITHUB_TREE_LIMIT
+                ));
+            }
+
+            // Store push state in transient (expires in 1 hour)
+            $push_state = array(
+                'token' => $token,
+                'repo' => $repo,
+                'branch' => $branch,
+                'commit_sha' => $current_commit_sha,
+                'files' => $files,
+                'total_files' => $total_files,
+                'processed_files' => 0,
+                'tree_items' => array(),
+                'current_chunk' => 0,
+                'total_chunks' => (int) ceil($total_files / self::CHUNK_SIZE),
+                'started_at' => time()
+            );
+
+            set_transient('github_push_state', $push_state, 3600);
+
+            $this->log("Ready to upload in {$push_state['total_chunks']} chunks");
+
+            wp_send_json_success(array(
+                'total_files' => $total_files,
+                'total_chunks' => $push_state['total_chunks'],
+                'chunk_size' => self::CHUNK_SIZE
+            ));
+
         } catch (Exception $e) {
-            $this->log('Error: ' . $e->getMessage());
+            $this->log('✗ Initialization failed: ' . $e->getMessage());
+            delete_transient('github_push_state');
             wp_send_json_error($e->getMessage());
         }
+    }
+
+    /**
+     * Process a single chunk of files
+     */
+    public function ajax_github_push_chunk() {
+        check_ajax_referer('static_exporter_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('Unauthorized');
+        }
+
+        // Extend execution time for this chunk
+        @set_time_limit(self::CHUNK_TIMEOUT);
+
+        $chunk_num = isset($_POST['chunk']) ? (int) $_POST['chunk'] : 0;
+
+        $push_state = get_transient('github_push_state');
+        if (!$push_state) {
+            wp_send_json_error('Push state expired. Please restart the upload.');
+        }
+
+        try {
+            $token = $push_state['token'];
+            $repo = $push_state['repo'];
+            $files = $push_state['files'];
+            $tree_items = $push_state['tree_items'];
+
+            $start_index = $chunk_num * self::CHUNK_SIZE;
+            $chunk_files = array_slice($files, $start_index, self::CHUNK_SIZE);
+
+            $this->log("Processing chunk " . ($chunk_num + 1) . "/" . $push_state['total_chunks'] . " (" . count($chunk_files) . " files)");
+
+            foreach ($chunk_files as $file) {
+                $relative_path = str_replace($this->export_dir . '/', '', $file);
+                $relative_path = str_replace('\\', '/', $relative_path);
+
+                // Skip very large files
+                $file_size = filesize($file);
+                if ($file_size > self::MAX_FILE_SIZE) {
+                    $this->log("Skipping large file: $relative_path");
+                    $push_state['processed_files']++;
+                    continue;
+                }
+
+                $content = file_get_contents($file);
+
+                // Create blob
+                $blob_response = $this->api_request_with_retry(
+                    "https://api.github.com/repos/$repo/git/blobs",
+                    array(
+                        'method' => 'POST',
+                        'headers' => array(
+                            'Authorization' => 'Bearer ' . $token,
+                            'User-Agent' => 'WordPress-Static-Exporter',
+                            'Content-Type' => 'application/json',
+                            'Accept' => 'application/vnd.github.v3+json'
+                        ),
+                        'body' => json_encode(array(
+                            'content' => base64_encode($content),
+                            'encoding' => 'base64'
+                        )),
+                        'timeout' => self::API_TIMEOUT,
+                        'sslverify' => true
+                    ),
+                    "Upload blob for $relative_path"
+                );
+
+                unset($content);
+
+                $blob_code = wp_remote_retrieve_response_code($blob_response);
+                if ($blob_code !== 201) {
+                    throw new Exception("Failed to create blob for $relative_path");
+                }
+
+                $blob_data = json_decode(wp_remote_retrieve_body($blob_response), true);
+
+                $tree_items[] = array(
+                    'path' => $relative_path,
+                    'mode' => '100644',
+                    'type' => 'blob',
+                    'sha' => $blob_data['sha']
+                );
+
+                $push_state['processed_files']++;
+
+                unset($blob_response, $blob_data);
+                gc_collect_cycles();
+            }
+
+            // Update state
+            $push_state['tree_items'] = $tree_items;
+            $push_state['current_chunk'] = $chunk_num + 1;
+            set_transient('github_push_state', $push_state, 3600);
+
+            $progress_percent = ($push_state['processed_files'] / $push_state['total_files']) * 100;
+
+            wp_send_json_success(array(
+                'chunk' => $chunk_num,
+                'processed_files' => $push_state['processed_files'],
+                'total_files' => $push_state['total_files'],
+                'progress' => round($progress_percent, 1),
+                'completed' => ($push_state['current_chunk'] >= $push_state['total_chunks'])
+            ));
+
+        } catch (Exception $e) {
+            $this->log('✗ Chunk upload failed: ' . $e->getMessage());
+            wp_send_json_error($e->getMessage());
+        }
+    }
+
+    /**
+     * Finalize the push by creating tree and commit
+     */
+    public function ajax_github_push_finalize() {
+        check_ajax_referer('static_exporter_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('Unauthorized');
+        }
+
+        $push_state = get_transient('github_push_state');
+        if (!$push_state) {
+            wp_send_json_error('Push state expired');
+        }
+
+        try {
+            $token = $push_state['token'];
+            $repo = $push_state['repo'];
+            $branch = $push_state['branch'];
+            $current_commit_sha = $push_state['commit_sha'];
+            $tree_items = $push_state['tree_items'];
+
+            if (empty($tree_items)) {
+                throw new Exception('No files were uploaded');
+            }
+
+            $this->log('Creating git tree with ' . count($tree_items) . ' items...');
+
+            // Create the tree
+            $tree_response = $this->api_request_with_retry(
+                "https://api.github.com/repos/$repo/git/trees",
+                array(
+                    'method' => 'POST',
+                    'headers' => array(
+                        'Authorization' => 'Bearer ' . $token,
+                        'User-Agent' => 'WordPress-Static-Exporter',
+                        'Content-Type' => 'application/json',
+                        'Accept' => 'application/vnd.github.v3+json'
+                    ),
+                    'body' => json_encode(array(
+                        'tree' => $tree_items
+                    )),
+                    'timeout' => self::API_TIMEOUT,
+                    'sslverify' => true
+                ),
+                'Create git tree'
+            );
+
+            $tree_code = wp_remote_retrieve_response_code($tree_response);
+            if ($tree_code !== 201) {
+                throw new Exception('Failed to create tree');
+            }
+
+            $tree_data = json_decode(wp_remote_retrieve_body($tree_response), true);
+            $tree_sha = $tree_data['sha'] ?? null;
+
+            if (!$tree_sha) {
+                throw new Exception('Could not create tree');
+            }
+
+            $this->log('Creating commit...');
+
+            // Create commit
+            $commit_message = 'Deploy from WordPress - ' . date('Y-m-d H:i:s');
+            $commit_response = $this->api_request_with_retry(
+                "https://api.github.com/repos/$repo/git/commits",
+                array(
+                    'method' => 'POST',
+                    'headers' => array(
+                        'Authorization' => 'Bearer ' . $token,
+                        'User-Agent' => 'WordPress-Static-Exporter',
+                        'Content-Type' => 'application/json',
+                        'Accept' => 'application/vnd.github.v3+json'
+                    ),
+                    'body' => json_encode(array(
+                        'message' => $commit_message,
+                        'tree' => $tree_sha,
+                        'parents' => array($current_commit_sha)
+                    )),
+                    'timeout' => self::API_TIMEOUT,
+                    'sslverify' => true
+                ),
+                'Create commit'
+            );
+
+            $commit_code = wp_remote_retrieve_response_code($commit_response);
+            if ($commit_code !== 201) {
+                throw new Exception('Failed to create commit');
+            }
+
+            $commit_data = json_decode(wp_remote_retrieve_body($commit_response), true);
+            $new_commit_sha = $commit_data['sha'] ?? null;
+
+            if (!$new_commit_sha) {
+                throw new Exception('Could not create commit');
+            }
+
+            $this->log('Updating branch...');
+
+            // Update branch
+            $update_response = $this->api_request_with_retry(
+                "https://api.github.com/repos/$repo/git/refs/heads/$branch",
+                array(
+                    'method' => 'PATCH',
+                    'headers' => array(
+                        'Authorization' => 'Bearer ' . $token,
+                        'User-Agent' => 'WordPress-Static-Exporter',
+                        'Content-Type' => 'application/json',
+                        'Accept' => 'application/vnd.github.v3+json'
+                    ),
+                    'body' => json_encode(array(
+                        'sha' => $new_commit_sha,
+                        'force' => false
+                    )),
+                    'timeout' => self::API_TIMEOUT,
+                    'sslverify' => true
+                ),
+                'Update branch reference'
+            );
+
+            $update_code = wp_remote_retrieve_response_code($update_response);
+            if ($update_code !== 200) {
+                throw new Exception('Failed to update branch');
+            }
+
+            $this->log('✓ Successfully pushed to GitHub!');
+            $this->log('Commit: ' . substr($new_commit_sha, 0, 7));
+            $this->log('Files: ' . count($tree_items));
+
+            // Clean up
+            delete_transient('github_push_state');
+
+            wp_send_json_success(array(
+                'message' => 'Pushed to GitHub',
+                'commit_sha' => substr($new_commit_sha, 0, 7),
+                'files' => count($tree_items)
+            ));
+
+        } catch (Exception $e) {
+            $this->log('✗ Finalization failed: ' . $e->getMessage());
+            wp_send_json_error($e->getMessage());
+        }
+    }
+
+    /**
+     * Get push status (for progress tracking)
+     */
+    public function ajax_github_push_status() {
+        check_ajax_referer('static_exporter_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('Unauthorized');
+        }
+
+        $push_state = get_transient('github_push_state');
+
+        if (!$push_state) {
+            wp_send_json_success(array('status' => 'idle'));
+        } else {
+            wp_send_json_success(array(
+                'status' => 'processing',
+                'processed_files' => $push_state['processed_files'],
+                'total_files' => $push_state['total_files'],
+                'current_chunk' => $push_state['current_chunk'],
+                'total_chunks' => $push_state['total_chunks'],
+                'progress' => round(($push_state['processed_files'] / $push_state['total_files']) * 100, 1)
+            ));
+        }
+    }
+
+    /**
+     * LEGACY: Keep old method for backward compatibility and auto-export
+     * Now redirects to chunked processing for manual use
+     */
+    public function ajax_push_to_github() {
+        check_ajax_referer('static_exporter_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('Unauthorized');
+        }
+
+        // For AJAX calls from the admin UI, redirect to chunked processing
+        // This will be handled by the JavaScript
+        wp_send_json_success(array('use_chunked' => true));
     }
 
     /**
@@ -786,6 +1288,10 @@ class WP_Static_Exporter {
     }
 
     private function push_to_github_api($token, $repo, $branch) {
+        // Increase memory limit and execution time for large uploads
+        @ini_set('memory_limit', '512M');
+        @set_time_limit(900); // 15 minutes
+
         $this->log('Getting repository information...');
 
         // Verify credentials first
@@ -833,8 +1339,8 @@ class WP_Static_Exporter {
 
         $this->log('Current commit: ' . substr($current_commit_sha, 0, 7));
 
-        // Get all files
-        $files = $this->get_all_files($this->export_dir);
+        // Get all files using memory-efficient method
+        $files = $this->get_all_files_efficient($this->export_dir);
         $total_files = count($files);
         $this->log("Found $total_files files to upload");
 
@@ -848,15 +1354,18 @@ class WP_Static_Exporter {
         }
 
         // Process in batches to avoid API limits
-        $batches = array_chunk($files, self::BATCH_SIZE);
-        $total_batches = count($batches);
+        $total_batches = (int) ceil($total_files / self::BATCH_SIZE);
 
         $this->log("Processing in $total_batches batches...");
 
         $all_tree_items = array();
 
-        foreach ($batches as $batch_num => $batch_files) {
-            $batch_num++; // 1-indexed for display
+        // Process files in batches to avoid memory issues
+        $file_index = 0;
+        for ($batch_num = 1; $batch_num <= $total_batches; $batch_num++) {
+            $batch_start = ($batch_num - 1) * self::BATCH_SIZE;
+            $batch_files = array_slice($files, $batch_start, self::BATCH_SIZE);
+
             $this->log("Batch $batch_num/$total_batches: Processing " . count($batch_files) . " files...");
 
             foreach ($batch_files as $file) {
@@ -898,6 +1407,9 @@ class WP_Static_Exporter {
                         "Upload blob for $relative_path"
                     );
 
+                    // Free memory immediately after upload
+                    unset($content);
+
                     $blob_code = wp_remote_retrieve_response_code($blob_response);
                     if ($blob_code !== 201) {
                         $blob_body = json_decode(wp_remote_retrieve_body($blob_response), true);
@@ -914,9 +1426,20 @@ class WP_Static_Exporter {
                         'sha' => $blob_data['sha']
                     );
 
+                    // Clean up response data
+                    unset($blob_response, $blob_data);
+
+                    // Periodic garbage collection
+                    $file_index++;
+                    if ($file_index % 10 === 0) {
+                        gc_collect_cycles();
+                    }
+
                 } catch (Exception $e) {
                     // Log error but continue with other files
                     $this->log("Error uploading $relative_path: " . $e->getMessage());
+                    // Cleanup on error too
+                    unset($content);
                 }
             }
 
@@ -1097,23 +1620,42 @@ class WP_Static_Exporter {
         $this->log('✓ Kinsta deployment triggered successfully');
     }
 
-    private function get_all_files($dir) {
+    /**
+     * Get all files - memory efficient version for large directories
+     */
+    private function get_all_files_efficient($dir) {
         $files = array();
 
         if (!file_exists($dir)) return $files;
 
-        $iterator = new RecursiveIteratorIterator(
-            new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS),
-            RecursiveIteratorIterator::SELF_FIRST
-        );
+        try {
+            $iterator = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS),
+                RecursiveIteratorIterator::LEAVES_ONLY
+            );
 
-        foreach ($iterator as $file) {
-            if ($file->isFile()) {
-                $files[] = $file->getPathname();
+            foreach ($iterator as $file) {
+                if ($file->isFile()) {
+                    $files[] = $file->getPathname();
+                }
+
+                // Free memory periodically
+                if (count($files) % 500 === 0) {
+                    gc_collect_cycles();
+                }
             }
+        } catch (Exception $e) {
+            $this->log('Error scanning directory: ' . $e->getMessage());
         }
 
         return $files;
+    }
+
+    /**
+     * Legacy method - kept for backwards compatibility
+     */
+    private function get_all_files($dir) {
+        return $this->get_all_files_efficient($dir);
     }
 
     private function clean_directory($dir) {
