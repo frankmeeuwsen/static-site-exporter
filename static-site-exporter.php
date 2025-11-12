@@ -3,16 +3,23 @@
  * Plugin Name: Static Site Exporter to Kinsta
  * Plugin URI: https://example.com
  * Description: Export WordPress site to static HTML and deploy to GitHub/Kinsta Static Hosting
- * Version: 2.2.0
+ * Version: 2.3.0
  * Author: Monique Dubbelman
  * License: GPL v2 or later
  *
  * Changelog:
+ * 2.3.0 - PERFORMANCE: Incremental export and push (only changed files)
+ *       - Track last modified time for posts/pages
+ *       - Only export changed content since last export
+ *       - Compare file hashes with GitHub before pushing
+ *       - Only push changed files to GitHub
+ *       - Dramatically reduces export and push time from minutes to seconds
  * 2.2.0 - MAJOR FIX: Comprehensive URL conversion for CSS/JS/images
  *       - Improved make_urls_relative() to handle escaped and encoded URLs
  *       - Fixes JavaScript-escaped URLs (http:\/\/)
  *       - Fixes URL-encoded URLs (http%3A%2F%2F)
  *       - Fixes broken CSS, images, and responsive viewport issues
+ *       - Fixed session blocking timeout issue
  * 2.1.1 - CRITICAL FIX: Exclude Simply Static temp files and debug logs from export
  *       - Added recursive_copy_with_exclusions() method
  *       - Prevents 355MB debug file from being exported
@@ -613,11 +620,21 @@ class WP_Static_Exporter {
         set_transient('static_export_in_progress', true, 3600); // 1 hour max
 
         try {
-            $this->log('Starting static site export...');
+            $this->log('Starting incremental static site export...');
 
-            // Clean and create directories
-            $this->clean_directory($this->export_dir);
-            $this->clean_directory($this->temp_dir);
+            // Get last export time
+            $last_export_time = get_option('static_export_last_time', 0);
+            $is_first_export = ($last_export_time == 0);
+
+            if ($is_first_export) {
+                $this->log('First export detected - exporting all content');
+                // Clean directories on first export
+                $this->clean_directory($this->export_dir);
+                $this->clean_directory($this->temp_dir);
+            } else {
+                $last_export_date = date('Y-m-d H:i:s', $last_export_time);
+                $this->log("Incremental export - checking changes since $last_export_date");
+            }
 
             wp_mkdir_p($this->export_dir);
             wp_mkdir_p($this->temp_dir);
@@ -628,44 +645,83 @@ class WP_Static_Exporter {
                 session_write_close();
             }
 
-            // Export homepage
-            $this->export_page(home_url('/'), 'index.html');
+            $exported_count = 0;
 
-            // Export all pages
-            $pages = get_pages();
-            $this->log('Exporting ' . count($pages) . ' pages...');
+            // Always export homepage (it may reflect recent changes)
+            $this->export_page(home_url('/'), 'index.html');
+            $exported_count++;
+
+            // Get changed pages
+            $pages_args = array(
+                'post_type' => 'page',
+                'post_status' => 'publish',
+                'posts_per_page' => -1
+            );
+
+            if (!$is_first_export) {
+                $pages_args['date_query'] = array(
+                    array(
+                        'column' => 'post_modified',
+                        'after' => date('Y-m-d H:i:s', $last_export_time),
+                        'inclusive' => false
+                    )
+                );
+            }
+
+            $pages = get_posts($pages_args);
+            $this->log('Found ' . count($pages) . ' ' . ($is_first_export ? '' : 'changed ') . 'pages to export');
+
             foreach ($pages as $page) {
                 $url = get_permalink($page->ID);
                 $path = parse_url($url, PHP_URL_PATH);
                 $filename = trim($path, '/') . '/index.html';
                 $this->export_page($url, $filename);
+                $exported_count++;
             }
 
-            // Export all posts (paginated to avoid memory issues)
+            // Get changed posts (paginated to avoid memory issues)
             $posts_per_page = 100;
             $offset = 0;
             $total_posts = 0;
 
             while (true) {
-                $posts = get_posts(array(
+                $posts_args = array(
+                    'post_type' => 'post',
+                    'post_status' => 'publish',
                     'numberposts' => $posts_per_page,
                     'offset' => $offset,
                     'orderby' => 'ID',
                     'order' => 'ASC'
-                ));
+                );
+
+                if (!$is_first_export) {
+                    $posts_args['date_query'] = array(
+                        array(
+                            'column' => 'post_modified',
+                            'after' => date('Y-m-d H:i:s', $last_export_time),
+                            'inclusive' => false
+                        )
+                    );
+                }
+
+                $posts = get_posts($posts_args);
 
                 if (empty($posts)) {
                     break;
                 }
 
                 $total_posts += count($posts);
-                $this->log('Exporting posts ' . ($offset + 1) . '-' . ($offset + count($posts)) . '...');
+                if ($total_posts == count($posts)) {
+                    // First batch
+                    $this->log('Found ' . $total_posts . ($is_first_export ? '' : ' changed') . ' posts to export...');
+                }
 
                 foreach ($posts as $post) {
                     $url = get_permalink($post->ID);
                     $path = parse_url($url, PHP_URL_PATH);
                     $filename = trim($path, '/') . '/index.html';
                     $this->export_page($url, $filename);
+                    $exported_count++;
                 }
 
                 $offset += $posts_per_page;
@@ -678,13 +734,22 @@ class WP_Static_Exporter {
 
             $this->log('Exported ' . $total_posts . ' posts total');
 
-            // Copy assets
-            $this->copy_assets();
+            // Copy assets (only if first export or if assets have changed)
+            if ($is_first_export) {
+                $this->log('Copying all assets...');
+                $this->copy_assets();
+            } else {
+                $this->log('Checking for changed assets...');
+                $this->copy_changed_assets($last_export_time);
+            }
 
             // Create config files
             $this->create_config_files();
 
-            $this->log('Export completed successfully!');
+            // Update last export time
+            update_option('static_export_last_time', time());
+
+            $this->log("✓ Export completed! Exported $exported_count files.");
 
         } finally {
             // Always release lock, even if export fails
@@ -794,6 +859,80 @@ class WP_Static_Exporter {
         $theme_dir = get_stylesheet_directory();
         $theme_dest = $this->export_dir . '/wp-content/themes/' . get_stylesheet();
         $this->recursive_copy($theme_dir, $theme_dest);
+    }
+
+    /**
+     * Copy only changed assets since last export (v2.3.0)
+     * Dramatically speeds up incremental exports
+     */
+    private function copy_changed_assets($last_export_time) {
+        $copied_count = 0;
+
+        // Check uploads for changed files
+        $uploads_dir = wp_upload_dir();
+        $source = $uploads_dir['basedir'];
+        $dest = $this->export_dir . '/wp-content/uploads';
+
+        if (file_exists($source)) {
+            $copied_count += $this->recursive_copy_changed($source, $dest, $last_export_time, array(
+                'simply-static',
+                'static-export',
+                'static-export-temp'
+            ));
+        }
+
+        // Theme assets - only copy if theme files changed
+        $theme_dir = get_stylesheet_directory();
+        $theme_dest = $this->export_dir . '/wp-content/themes/' . get_stylesheet();
+        $copied_count += $this->recursive_copy_changed($theme_dir, $theme_dest, $last_export_time);
+
+        if ($copied_count > 0) {
+            $this->log("Copied $copied_count changed asset files");
+        } else {
+            $this->log('No asset changes detected');
+        }
+    }
+
+    /**
+     * Recursively copy only files modified after a given timestamp
+     */
+    private function recursive_copy_changed($src, $dst, $since_time, $exclusions = array()) {
+        if (!file_exists($src)) return 0;
+
+        $copied = 0;
+        $dir = opendir($src);
+        @wp_mkdir_p($dst);
+
+        while (false !== ($file = readdir($dir))) {
+            if ($file == '.' || $file == '..') continue;
+
+            // Check exclusions
+            $skip = false;
+            foreach ($exclusions as $exclusion) {
+                if (stripos($file, $exclusion) !== false) {
+                    $skip = true;
+                    break;
+                }
+            }
+            if ($skip) continue;
+
+            $src_file = $src . '/' . $file;
+            $dst_file = $dst . '/' . $file;
+
+            if (is_dir($src_file)) {
+                $copied += $this->recursive_copy_changed($src_file, $dst_file, $since_time, $exclusions);
+            } else {
+                // Only copy if file is newer than last export
+                $file_mtime = filemtime($src_file);
+                if ($file_mtime > $since_time) {
+                    copy($src_file, $dst_file);
+                    $copied++;
+                }
+            }
+        }
+
+        closedir($dir);
+        return $copied;
     }
 
     /**
@@ -920,16 +1059,34 @@ class WP_Static_Exporter {
                 throw new Exception('Could not find current commit SHA');
             }
 
-            // Get all files
-            $files = $this->get_all_files_efficient($this->export_dir);
+            // Get all local files
+            $all_files = $this->get_all_files_efficient($this->export_dir);
+            $this->log("Scanning " . count($all_files) . " local files...");
+
+            // Get existing GitHub tree to compare hashes (v2.3.0 - incremental push)
+            $this->log("Fetching existing GitHub tree for comparison...");
+            $existing_tree = $this->get_github_tree($token, $repo, $current_commit_sha);
+
+            // Compare and filter to only changed files
+            $files = $this->filter_changed_files($all_files, $existing_tree);
             $total_files = count($files);
 
-            $this->log("Found $total_files files to upload");
+            if ($total_files == 0) {
+                $this->log("✓ No file changes detected - nothing to push!");
+                wp_send_json_success(array(
+                    'total_files' => 0,
+                    'total_chunks' => 0,
+                    'message' => 'No changes to push'
+                ));
+                return;
+            }
 
-            if ($total_files >= self::GITHUB_TREE_LIMIT) {
+            $this->log("Found $total_files changed files to upload (skipped " . (count($all_files) - $total_files) . " unchanged)");
+
+            if (count($all_files) >= self::GITHUB_TREE_LIMIT) {
                 throw new Exception(sprintf(
                     'Site has %d files, exceeds GitHub limit of %d',
-                    $total_files,
+                    count($all_files),
                     self::GITHUB_TREE_LIMIT
                 ));
             }
@@ -1695,6 +1852,103 @@ class WP_Static_Exporter {
         }
 
         update_option('static_exporter_log', $current_log . $new_entry);
+    }
+
+    /**
+     * Get GitHub tree for comparison (v2.3.0)
+     * Returns array of path => sha mappings
+     */
+    private function get_github_tree($token, $repo, $commit_sha) {
+        try {
+            // Get commit to find tree SHA
+            $commit_response = $this->api_request_with_retry(
+                "https://api.github.com/repos/$repo/git/commits/$commit_sha",
+                array(
+                    'headers' => array(
+                        'Authorization' => 'Bearer ' . $token,
+                        'User-Agent' => 'WordPress-Static-Exporter',
+                        'Accept' => 'application/vnd.github.v3+json'
+                    ),
+                    'timeout' => self::API_TIMEOUT,
+                    'sslverify' => true
+                ),
+                'Get commit tree'
+            );
+
+            $commit_data = json_decode(wp_remote_retrieve_body($commit_response), true);
+            $tree_sha = $commit_data['tree']['sha'] ?? null;
+
+            if (!$tree_sha) {
+                $this->log('Warning: Could not get tree SHA, will push all files');
+                return array();
+            }
+
+            // Get full tree recursively
+            $tree_response = $this->api_request_with_retry(
+                "https://api.github.com/repos/$repo/git/trees/$tree_sha?recursive=1",
+                array(
+                    'headers' => array(
+                        'Authorization' => 'Bearer ' . $token,
+                        'User-Agent' => 'WordPress-Static-Exporter',
+                        'Accept' => 'application/vnd.github.v3+json'
+                    ),
+                    'timeout' => self::API_TIMEOUT,
+                    'sslverify' => true
+                ),
+                'Get repository tree'
+            );
+
+            $tree_data = json_decode(wp_remote_retrieve_body($tree_response), true);
+            $tree = array();
+
+            if (isset($tree_data['tree']) && is_array($tree_data['tree'])) {
+                foreach ($tree_data['tree'] as $item) {
+                    if ($item['type'] === 'blob') {
+                        $tree[$item['path']] = $item['sha'];
+                    }
+                }
+                $this->log('Retrieved ' . count($tree) . ' files from GitHub tree');
+            }
+
+            return $tree;
+
+        } catch (Exception $e) {
+            $this->log('Warning: Could not fetch GitHub tree: ' . $e->getMessage());
+            $this->log('Will push all files as fallback');
+            return array();
+        }
+    }
+
+    /**
+     * Filter files to only those that changed (v2.3.0)
+     * Compares local file SHA with GitHub tree SHA
+     */
+    private function filter_changed_files($local_files, $github_tree) {
+        // If no GitHub tree available, return all files
+        if (empty($github_tree)) {
+            return $local_files;
+        }
+
+        $changed_files = array();
+
+        foreach ($local_files as $file) {
+            $relative_path = str_replace($this->export_dir . '/', '', $file);
+            $relative_path = str_replace('\\', '/', $relative_path);
+
+            // Calculate local file SHA (same way GitHub does it)
+            $content = file_get_contents($file);
+            $local_sha = sha1('blob ' . strlen($content) . "\0" . $content);
+
+            // Compare with GitHub SHA
+            $github_sha = $github_tree[$relative_path] ?? null;
+
+            if ($github_sha !== $local_sha) {
+                // File is new or changed
+                $changed_files[] = $file;
+            }
+        }
+
+        return $changed_files;
     }
 }
 
