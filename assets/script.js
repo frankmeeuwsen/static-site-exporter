@@ -5,6 +5,7 @@ jQuery(document).ready(function($) {
     const $exportBtn = $('#export-site');
     const $githubBtn = $('#push-github');
     const $kinstaBtn = $('#deploy-kinsta');
+    const $resetBtn = $('#reset-lock');
     const $log = $('#export-log');
     const $progress = $('#export-progress');
     const $progressBar = $('.progress-bar');
@@ -87,131 +88,48 @@ jQuery(document).ready(function($) {
         });
     });
     
-    // Push to GitHub - NEW CHUNKED VERSION
+    // Push to GitHub - SIMPLE GIT VERSION
     $githubBtn.on('click', function() {
         if (!exportCompleted) {
             log('⚠ Please export the site first', 'error');
             return;
         }
 
-        log('Initializing GitHub push...', 'info');
+        log('Deploying to GitHub...', 'info');
         setLoading($githubBtn, true);
-        showProgress(5, 'Initializing...');
+        showProgress(30, 'Committing and pushing...');
 
-        // Step 1: Initialize the push
         $.ajax({
             url: staticExporter.ajax_url,
             type: 'POST',
             data: {
-                action: 'github_push_init',
+                action: 'git_deploy',
                 nonce: staticExporter.nonce
             },
-            success: function(response) {
-                if (response.success) {
-                    const totalChunks = response.data.total_chunks;
-                    const totalFiles = response.data.total_files;
-
-                    log('Found ' + totalFiles + ' files to upload in ' + totalChunks + ' batches', 'info');
-                    showProgress(10, 'Starting upload...');
-
-                    // Step 2: Upload chunks sequentially
-                    uploadChunks(0, totalChunks);
-                } else {
-                    log('✗ Initialization failed: ' + response.data, 'error');
-                    hideProgress();
-                    setLoading($githubBtn, false);
-                }
-            },
-            error: function(xhr, status, error) {
-                log('✗ Initialization failed: ' + error, 'error');
-                hideProgress();
-                setLoading($githubBtn, false);
-            }
-        });
-    });
-
-    // Function to upload chunks recursively
-    function uploadChunks(currentChunk, totalChunks) {
-        if (currentChunk >= totalChunks) {
-            // All chunks uploaded, finalize
-            finalizeGithubPush();
-            return;
-        }
-
-        const chunkNum = currentChunk + 1;
-        const progress = 10 + ((currentChunk / totalChunks) * 80); // 10-90%
-
-        log('Uploading batch ' + chunkNum + '/' + totalChunks + '...', 'info');
-        showProgress(progress, 'Uploading batch ' + chunkNum + '/' + totalChunks);
-
-        $.ajax({
-            url: staticExporter.ajax_url,
-            type: 'POST',
-            data: {
-                action: 'github_push_chunk',
-                nonce: staticExporter.nonce,
-                chunk: currentChunk
-            },
-            timeout: 60000, // 60 second timeout per chunk
-            success: function(response) {
-                if (response.success) {
-                    const data = response.data;
-                    log('Batch ' + chunkNum + ' complete: ' + data.processed_files + '/' + data.total_files + ' files (' + data.progress + '%)', 'info');
-
-                    // Upload next chunk
-                    uploadChunks(currentChunk + 1, totalChunks);
-                } else {
-                    log('✗ Batch ' + chunkNum + ' failed: ' + response.data, 'error');
-                    hideProgress();
-                    setLoading($githubBtn, false);
-                }
-            },
-            error: function(xhr, status, error) {
-                log('✗ Batch ' + chunkNum + ' failed: ' + error, 'error');
-                log('You can try clicking "Push to GitHub" again to resume', 'info');
-                hideProgress();
-                setLoading($githubBtn, false);
-            }
-        });
-    }
-
-    // Function to finalize the GitHub push
-    function finalizeGithubPush() {
-        log('Finalizing push...', 'info');
-        showProgress(95, 'Creating commit...');
-
-        $.ajax({
-            url: staticExporter.ajax_url,
-            type: 'POST',
-            data: {
-                action: 'github_push_finalize',
-                nonce: staticExporter.nonce
-            },
-            timeout: 60000,
+            timeout: 60000, // 60 seconds
             success: function(response) {
                 showProgress(100, 'Complete!');
 
                 if (response.success) {
                     log('✓ Successfully pushed to GitHub!', 'success');
-                    log('→ Commit: ' + response.data.commit_sha, 'info');
-                    log('→ Files: ' + response.data.files, 'info');
+                    log('→ Kinsta will auto-deploy in 2-5 minutes', 'info');
                     githubPushed = true;
                     enableButton($kinstaBtn);
 
                     setTimeout(hideProgress, 2000);
                 } else {
-                    log('✗ Finalization failed: ' + response.data, 'error');
+                    log('✗ Push failed: ' + response.data, 'error');
                     hideProgress();
                 }
                 setLoading($githubBtn, false);
             },
             error: function(xhr, status, error) {
-                log('✗ Finalization failed: ' + error, 'error');
+                log('✗ Push failed: ' + error, 'error');
                 hideProgress();
                 setLoading($githubBtn, false);
             }
         });
-    }
+    });
     
     // Deploy to Kinsta
     $kinstaBtn.on('click', function() {
@@ -301,5 +219,37 @@ jQuery(document).ready(function($) {
         if (pollInterval) {
             clearInterval(pollInterval);
         }
+    });
+
+    // Reset export lock
+    $resetBtn.on('click', function() {
+        if (!confirm('Are you sure you want to reset the export lock? Only do this if an export is stuck.')) {
+            return;
+        }
+
+        log('Resetting export lock...', 'info');
+        setLoading($resetBtn, true);
+
+        $.ajax({
+            url: staticExporter.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'reset_export_lock',
+                nonce: staticExporter.nonce
+            },
+            success: function(response) {
+                if (response.success) {
+                    log('✓ ' + response.data.message, 'success');
+                } else {
+                    log('✗ Reset failed: ' + response.data, 'error');
+                }
+            },
+            error: function(xhr, status, error) {
+                log('✗ Reset failed: ' + error, 'error');
+            },
+            complete: function() {
+                setLoading($resetBtn, false);
+            }
+        });
     });
 });

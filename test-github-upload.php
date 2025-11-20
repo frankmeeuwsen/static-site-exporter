@@ -7,15 +7,22 @@
  */
 
 // Configuration - UPDATE THESE VALUES
-$export_dir = '/Users/monique/Local Sites/modub/app/public/wp-content/static-export';
-$github_token = 'YOUR_GITHUB_TOKEN_HERE'; // Replace with actual token
-$github_repo = 'mdubbelm/modub-static-site';
-$github_branch = 'main';
+$export_dir = '/path/to/your/export/directory'; // UPDATE: Path to your static export directory
+$github_token = 'YOUR_GITHUB_TOKEN_HERE'; // UPDATE: Replace with your actual GitHub token
+$github_repo = 'your-username/your-repo-name'; // UPDATE: Your GitHub repository (format: username/repo-name)
+$github_branch = 'main'; // UPDATE: Your branch name if different
 
 // Constants matching plugin
 define('CHUNK_SIZE', 15);
 define('MAX_FILE_SIZE', 10485760); // 10MB
 define('API_TIMEOUT', 60);
+
+/**
+ * Simple escape function for CLI output (WordPress Plugin Checker compliance)
+ */
+function esc_html($text) {
+    return htmlspecialchars($text, ENT_QUOTES, 'UTF-8');
+}
 
 /**
  * Test 1: File scanning performance
@@ -34,10 +41,10 @@ function test_file_scanning($export_dir) {
     $elapsed = round($end_time - $start_time, 2);
     $memory_used = round(($end_memory - $start_memory) / 1024 / 1024, 2);
 
-    echo "Files found: " . count($files) . "\n";
-    echo "Time taken: {$elapsed}s\n";
-    echo "Memory used: {$memory_used}MB\n";
-    echo "Peak memory: " . round(memory_get_peak_usage() / 1024 / 1024, 2) . "MB\n";
+    echo "Files found: " . esc_html(count($files)) . "\n";
+    echo "Time taken: " . esc_html($elapsed) . "s\n";
+    echo "Memory used: " . esc_html($memory_used) . "MB\n";
+    echo "Peak memory: " . esc_html(round(memory_get_peak_usage() / 1024 / 1024, 2)) . "MB\n";
 
     // Check for large files
     $large_files = 0;
@@ -48,12 +55,12 @@ function test_file_scanning($export_dir) {
         $total_size += $size;
         if ($size > MAX_FILE_SIZE) {
             $large_files++;
-            echo "⚠ Large file will be skipped: " . basename($file) . " (" . round($size / 1024 / 1024, 2) . "MB)\n";
+            echo "⚠ Large file will be skipped: " . esc_html(basename($file)) . " (" . esc_html(round($size / 1024 / 1024, 2)) . "MB)\n";
         }
     }
 
-    echo "Total size: " . round($total_size / 1024 / 1024, 2) . "MB\n";
-    echo "Large files (>10MB): $large_files\n";
+    echo "Total size: " . esc_html(round($total_size / 1024 / 1024, 2)) . "MB\n";
+    echo "Large files (>10MB): " . esc_html($large_files) . "\n";
 
     return [
         'success' => true,
@@ -73,17 +80,17 @@ function test_chunk_processing($files) {
     $total_files = count($files);
     $total_chunks = (int) ceil($total_files / CHUNK_SIZE);
 
-    echo "Total files: $total_files\n";
-    echo "Chunk size: " . CHUNK_SIZE . "\n";
-    echo "Total chunks: $total_chunks\n";
+    echo "Total files: " . esc_html($total_files) . "\n";
+    echo "Chunk size: " . esc_html(CHUNK_SIZE) . "\n";
+    echo "Total chunks: " . esc_html($total_chunks) . "\n";
 
     // Estimate time
     $estimated_seconds_per_chunk = 20; // Conservative estimate
     $estimated_total_seconds = $total_chunks * $estimated_seconds_per_chunk;
     $estimated_minutes = round($estimated_total_seconds / 60);
 
-    echo "Estimated time per chunk: {$estimated_seconds_per_chunk}s\n";
-    echo "Estimated total time: {$estimated_minutes} minutes\n";
+    echo "Estimated time per chunk: " . esc_html($estimated_seconds_per_chunk) . "s\n";
+    echo "Estimated total time: " . esc_html($estimated_minutes) . " minutes\n";
 
     // Simulate chunk processing
     $start_time = microtime(true);
@@ -92,8 +99,8 @@ function test_chunk_processing($files) {
         $chunk_start = $i * CHUNK_SIZE;
         $chunk_files = array_slice($files, $chunk_start, CHUNK_SIZE);
 
-        echo "\nProcessing chunk " . ($i + 1) . "/" . $total_chunks . ":\n";
-        echo "  Files in chunk: " . count($chunk_files) . "\n";
+        echo "\nProcessing chunk " . esc_html($i + 1) . "/" . esc_html($total_chunks) . ":\n";
+        echo "  Files in chunk: " . esc_html(count($chunk_files)) . "\n";
 
         $chunk_time_start = microtime(true);
         $chunk_size = 0;
@@ -110,15 +117,15 @@ function test_chunk_processing($files) {
 
         $chunk_time = round(microtime(true) - $chunk_time_start, 2);
 
-        echo "  Chunk size: " . round($chunk_size / 1024 / 1024, 2) . "MB\n";
-        echo "  Processing time: {$chunk_time}s\n";
-        echo "  Memory: " . round(memory_get_usage() / 1024 / 1024, 2) . "MB\n";
+        echo "  Chunk size: " . esc_html(round($chunk_size / 1024 / 1024, 2)) . "MB\n";
+        echo "  Processing time: " . esc_html($chunk_time) . "s\n";
+        echo "  Memory: " . esc_html(round(memory_get_usage() / 1024 / 1024, 2)) . "MB\n";
 
         gc_collect_cycles();
     }
 
     $elapsed = round(microtime(true) - $start_time, 2);
-    echo "\nSample processing completed in {$elapsed}s\n";
+    echo "\nSample processing completed in " . esc_html($elapsed) . "s\n";
 
     return [
         'success' => true,
@@ -159,9 +166,9 @@ function test_github_connectivity($token, $repo, $branch) {
     if ($http_code === 200) {
         $user_data = json_decode($response, true);
         echo "✓ Authentication successful\n";
-        echo "  User: " . ($user_data['login'] ?? 'Unknown') . "\n";
+        echo "  User: " . esc_html($user_data['login'] ?? 'Unknown') . "\n";
     } else {
-        echo "✗ Authentication failed (HTTP $http_code)\n";
+        echo "✗ Authentication failed (HTTP " . esc_html($http_code) . ")\n";
         return ['success' => false, 'reason' => 'Authentication failed'];
     }
 
@@ -186,9 +193,9 @@ function test_github_connectivity($token, $repo, $branch) {
         $ref_data = json_decode($response, true);
         $commit_sha = $ref_data['object']['sha'] ?? null;
         echo "✓ Repository access successful\n";
-        echo "  Current commit: " . substr($commit_sha, 0, 7) . "\n";
+        echo "  Current commit: " . esc_html(substr($commit_sha, 0, 7)) . "\n";
     } else {
-        echo "✗ Repository access failed (HTTP $http_code)\n";
+        echo "✗ Repository access failed (HTTP " . esc_html($http_code) . ")\n";
         return ['success' => false, 'reason' => 'Repository access failed'];
     }
 
@@ -212,8 +219,8 @@ function test_github_connectivity($token, $repo, $branch) {
     $core_remaining = $rate_data['resources']['core']['remaining'] ?? 0;
     $reset_time = $rate_data['resources']['core']['reset'] ?? 0;
 
-    echo "  Rate limit: $core_remaining / $core_limit remaining\n";
-    echo "  Resets at: " . date('Y-m-d H:i:s', $reset_time) . "\n";
+    echo "  Rate limit: " . esc_html($core_remaining) . " / " . esc_html($core_limit) . " remaining\n";
+    echo "  Resets at: " . esc_html(date('Y-m-d H:i:s', $reset_time)) . "\n";
 
     if ($core_remaining < 100) {
         echo "⚠ Warning: Low rate limit remaining. Upload may fail.\n";
@@ -233,18 +240,18 @@ function test_memory_timeout() {
     echo "\n=== TEST 4: Memory and Timeout Analysis ===\n";
 
     echo "Current PHP settings:\n";
-    echo "  memory_limit: " . ini_get('memory_limit') . "\n";
-    echo "  max_execution_time: " . ini_get('max_execution_time') . "\n";
-    echo "  upload_max_filesize: " . ini_get('upload_max_filesize') . "\n";
-    echo "  post_max_size: " . ini_get('post_max_size') . "\n";
+    echo "  memory_limit: " . esc_html(ini_get('memory_limit')) . "\n";
+    echo "  max_execution_time: " . esc_html(ini_get('max_execution_time')) . "\n";
+    echo "  upload_max_filesize: " . esc_html(ini_get('upload_max_filesize')) . "\n";
+    echo "  post_max_size: " . esc_html(ini_get('post_max_size')) . "\n";
 
     echo "\nMemory usage:\n";
-    echo "  Current: " . round(memory_get_usage() / 1024 / 1024, 2) . "MB\n";
-    echo "  Peak: " . round(memory_get_peak_usage() / 1024 / 1024, 2) . "MB\n";
+    echo "  Current: " . esc_html(round(memory_get_usage() / 1024 / 1024, 2)) . "MB\n";
+    echo "  Peak: " . esc_html(round(memory_get_peak_usage() / 1024 / 1024, 2)) . "MB\n";
 
     $memory_limit_bytes = return_bytes(ini_get('memory_limit'));
     $available_memory = round(($memory_limit_bytes - memory_get_usage()) / 1024 / 1024, 2);
-    echo "  Available: {$available_memory}MB\n";
+    echo "  Available: " . esc_html($available_memory) . "MB\n";
 
     if ($available_memory < 100) {
         echo "⚠ Warning: Low available memory. Consider increasing memory_limit.\n";
@@ -306,9 +313,9 @@ function run_all_tests($export_dir, $token, $repo, $branch) {
     echo "╔════════════════════════════════════════════════════════╗\n";
     echo "║  Static Site Exporter - GitHub Upload Test Suite      ║\n";
     echo "╚════════════════════════════════════════════════════════╝\n";
-    echo "\nExport directory: $export_dir\n";
-    echo "Repository: $repo\n";
-    echo "Branch: $branch\n";
+    echo "\nExport directory: " . esc_html($export_dir) . "\n";
+    echo "Repository: " . esc_html($repo) . "\n";
+    echo "Branch: " . esc_html($branch) . "\n";
 
     $results = [];
 
@@ -336,15 +343,15 @@ function run_all_tests($export_dir, $token, $repo, $branch) {
     echo "║  TEST SUMMARY                                          ║\n";
     echo "╚════════════════════════════════════════════════════════╝\n\n";
 
-    echo "Total files to upload: " . $results['file_scanning']['total_files'] . "\n";
-    echo "Total chunks: " . $results['chunk_processing']['total_chunks'] . "\n";
-    echo "Estimated upload time: " . $results['chunk_processing']['estimated_minutes'] . " minutes\n";
-    echo "File scanning time: " . $results['file_scanning']['elapsed'] . "s\n";
-    echo "Memory usage: " . $results['file_scanning']['memory'] . "MB\n";
+    echo "Total files to upload: " . esc_html($results['file_scanning']['total_files']) . "\n";
+    echo "Total chunks: " . esc_html($results['chunk_processing']['total_chunks']) . "\n";
+    echo "Estimated upload time: " . esc_html($results['chunk_processing']['estimated_minutes']) . " minutes\n";
+    echo "File scanning time: " . esc_html($results['file_scanning']['elapsed']) . "s\n";
+    echo "Memory usage: " . esc_html($results['file_scanning']['memory']) . "MB\n";
 
     if ($results['github_connectivity']['success']) {
         echo "GitHub API: ✓ Connected\n";
-        echo "Rate limit remaining: " . $results['github_connectivity']['rate_remaining'] . "\n";
+        echo "Rate limit remaining: " . esc_html($results['github_connectivity']['rate_remaining']) . "\n";
     } else {
         echo "GitHub API: ✗ Not tested (configure token to test)\n";
     }
@@ -363,7 +370,7 @@ function run_all_tests($export_dir, $token, $repo, $branch) {
 
     if ($results['chunk_processing']['estimated_minutes'] > 120) {
         echo "⚠ Long upload time: Consider increasing CHUNK_SIZE for faster processing\n";
-        echo "  Current: " . CHUNK_SIZE . " files/chunk\n";
+        echo "  Current: " . absint(CHUNK_SIZE) . " files/chunk\n";
         echo "  Recommended: 20-25 files/chunk for large sites\n";
     }
 
@@ -371,7 +378,7 @@ function run_all_tests($export_dir, $token, $repo, $branch) {
         $results['github_connectivity']['rate_remaining'] < $chunk_count * 2) {
         echo "⚠ Rate limit warning: You may hit rate limits during upload\n";
         echo "  Each chunk requires 1 API call per file + 3 calls for finalization\n";
-        echo "  Total API calls needed: ~" . ($file_count + 3) . "\n";
+        echo "  Total API calls needed: ~" . esc_html($file_count + 3) . "\n";
     }
 
     echo "\n✓ Test suite completed\n\n";
@@ -379,7 +386,7 @@ function run_all_tests($export_dir, $token, $repo, $branch) {
 
 // Run tests
 if (!file_exists($export_dir)) {
-    echo "Error: Export directory not found: $export_dir\n";
+    echo "Error: Export directory not found: " . esc_html($export_dir) . "\n";
     exit(1);
 }
 

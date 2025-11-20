@@ -1,13 +1,36 @@
 <?php
 /**
  * Plugin Name: Static Site Exporter to Kinsta
- * Plugin URI: https://example.com
+ * Plugin URI: https://github.com/mdubbelm/static-site-exporter
  * Description: Export WordPress site to static HTML and deploy to GitHub/Kinsta Static Hosting
- * Version: 2.3.0
+ * Version: 2.5.3
  * Author: Monique Dubbelman
  * License: GPL v2 or later
  *
  * Changelog:
+ * 2.5.3 - BUGFIX: Fix git command not found error
+ *       - Use full path to git binary (/usr/local/bin/git)
+ *       - Fixes error code 127 when deploying via PHP exec()
+ * 2.5.2 - BUGFIX: Auto-repair Git repository
+ *       - Automatically repair Git repository if .git directory is missing
+ *       - Fetches from remote and resets to latest commit
+ *       - No more manual Git repair needed
+ * 2.5.1 - NEW FEATURE: Reset Export Lock Button
+ *       - Added "Reset Export Lock" button in admin interface
+ *       - Clear stuck export locks without terminal access
+ *       - Includes confirmation dialog for safety
+ *       - Also clears GitHub push state
+ * 2.5.0 - NEW FEATURE: Activity Status Dashboard
+ *       - Visual dashboard showing last manual and auto exports
+ *       - Track last manual and auto GitHub pushes
+ *       - See what content was exported (page/post titles)
+ *       - View commit SHAs and file counts
+ *       - Human-readable timestamps
+ * 2.4.0 - WORKFLOW OPTIMIZATION: Simplified deployment process
+ *       - Export directly to Git repository location (no more rsync needed!)
+ *       - One-click deployment via Git shell commands
+ *       - Faster and more reliable than GitHub API approach
+ *       - Simplified admin interface workflow
  * 2.3.0 - PERFORMANCE: Incremental export and push (only changed files)
  *       - Track last modified time for posts/pages
  *       - Only export changed content since last export
@@ -41,25 +64,32 @@ if (!defined('ABSPATH')) exit;
 class WP_Static_Exporter {
     // Configuration constants
     const BATCH_SIZE = 50;              // Files per GitHub batch (LEGACY - kept for backward compatibility)
-    const CHUNK_SIZE = 15;              // Files per AJAX chunk (new chunked processing)
+    const CHUNK_SIZE = 10;              // Files per AJAX chunk (REDUCED from 15 - smaller chunks = more reliable)
     const MAX_FILE_SIZE = 10485760;     // 10MB in bytes
     const MAX_EXPORT_SIZE = 524288000;  // 500MB in bytes
     const GITHUB_TREE_LIMIT = 5000;     // GitHub tree item limit
-    const API_TIMEOUT = 60;             // API timeout in seconds
-    const PAGE_TIMEOUT = 30;            // Page fetch timeout
-    const BATCH_DELAY = 1;              // Seconds between batches (reduced from 2)
-    const MAX_RETRIES = 3;              // API retry attempts
+    const API_TIMEOUT = 120;            // API timeout in seconds (INCREASED from 60)
+    const PAGE_TIMEOUT = 90;            // Page fetch timeout (INCREASED from 30)
+    const BATCH_DELAY = 2;              // Seconds between batches (INCREASED from 1)
+    const MAX_RETRIES = 5;              // API retry attempts (INCREASED from 3)
     const LOG_MAX_SIZE = 102400;        // 100KB max log size
     const DEBOUNCE_TIME = 120;          // 2 minutes
     const SCHEDULE_DELAY = 30;          // 30 seconds
-    const CHUNK_TIMEOUT = 45;           // Timeout for chunked AJAX requests (seconds)
+    const CHUNK_TIMEOUT = 120;          // Timeout for chunked AJAX requests (INCREASED from 45)
+    const EXPORT_PAGE_DELAY = 1;        // NEW - delay between page exports
+    const MAX_POSTS_PER_BATCH = 50;     // NEW - reduced from 100
 
     private $export_dir;
     private $temp_dir;
     private $encryption_key;
 
     public function __construct() {
-        $this->export_dir = WP_CONTENT_DIR . '/static-export';
+        // Export directly to Git repository for seamless deployment
+        // Get export directory from settings, or use default WP content directory
+        $options = get_option('static_exporter_settings', array());
+        $this->export_dir = !empty($options['export_directory'])
+            ? $options['export_directory']
+            : WP_CONTENT_DIR . '/static-export';
         $this->temp_dir = WP_CONTENT_DIR . '/static-export-temp';
         $this->encryption_key = $this->get_encryption_key();
 
@@ -75,6 +105,12 @@ class WP_Static_Exporter {
         add_action('wp_ajax_github_push_chunk', array($this, 'ajax_github_push_chunk'));
         add_action('wp_ajax_github_push_finalize', array($this, 'ajax_github_push_finalize'));
         add_action('wp_ajax_github_push_status', array($this, 'ajax_github_push_status'));
+
+        // Git deployment via shell commands
+        add_action('wp_ajax_git_deploy', array($this, 'ajax_git_deploy'));
+
+        // Reset export lock
+        add_action('wp_ajax_reset_export_lock', array($this, 'ajax_reset_export_lock'));
 
         // Auto-export triggers
         $this->setup_auto_export_hooks();
@@ -231,8 +267,8 @@ class WP_Static_Exporter {
     public function enqueue_scripts($hook) {
         if ($hook !== 'toplevel_page_static-site-exporter') return;
 
-        wp_enqueue_style('static-exporter-css', plugin_dir_url(__FILE__) . 'assets/style.css');
-        wp_enqueue_script('static-exporter-js', plugin_dir_url(__FILE__) . 'assets/script.js', array('jquery'), '2.0', true);
+        wp_enqueue_style('static-exporter-css', plugin_dir_url(__FILE__) . 'assets/style.css', array(), '2.5.3');
+        wp_enqueue_script('static-exporter-js', plugin_dir_url(__FILE__) . 'assets/script.js', array('jquery'), '2.5.3', true);
         wp_localize_script('static-exporter-js', 'staticExporter', array(
             'ajax_url' => admin_url('admin-ajax.php'),
             'nonce' => wp_create_nonce('static_exporter_nonce')
@@ -308,6 +344,51 @@ class WP_Static_Exporter {
                                            value="<?php echo esc_attr($options['github_branch'] ?? 'main'); ?>" class="regular-text">
                                 </td>
                             </tr>
+                            <tr>
+                                <th><label for="export_directory">Export Directory</label></th>
+                                <td>
+                                    <div style="display: flex; gap: 10px; align-items: flex-start;">
+                                        <input type="text" id="export_directory" name="static_exporter_settings[export_directory]"
+                                               value="<?php echo esc_attr($options['export_directory'] ?? ''); ?>"
+                                               class="large-text code" style="flex: 1; min-width: 400px;"
+                                               placeholder="/Users/yourusername/Projecten/your-repo/public_static">
+                                        <button type="button" class="button" id="paste-directory-path"
+                                                style="white-space: nowrap;">
+                                            <span class="dashicons dashicons-clipboard" style="margin-top: 3px;"></span> Plak Pad
+                                        </button>
+                                    </div>
+                                    <p class="description" style="margin-top: 8px;">
+                                        <strong>Full path to your Git repository where static files should be exported.</strong><br>
+                                        Example: <code>/Users/username/Sites/my-static-site/public</code> or <code>/var/www/static-export</code><br>
+                                        <span style="color: #d63638;">⚠ This should point to your Git repository, not the Local Sites folder!</span>
+                                    </p>
+                                    <script>
+                                    document.addEventListener('DOMContentLoaded', function() {
+                                        const pasteBtn = document.getElementById('paste-directory-path');
+                                        const input = document.getElementById('export_directory');
+
+                                        if (pasteBtn && input) {
+                                            pasteBtn.addEventListener('click', async function() {
+                                                try {
+                                                    const text = await navigator.clipboard.readText();
+                                                    if (text) {
+                                                        input.value = text.trim();
+                                                        input.focus();
+                                                        // Visual feedback
+                                                        pasteBtn.innerHTML = '<span class="dashicons dashicons-yes" style="margin-top: 3px; color: #46b450;"></span> Geplakt!';
+                                                        setTimeout(() => {
+                                                            pasteBtn.innerHTML = '<span class="dashicons dashicons-clipboard" style="margin-top: 3px;"></span> Plak Pad';
+                                                        }, 2000);
+                                                    }
+                                                } catch (err) {
+                                                    alert('Kon niet plakken vanuit clipboard. Gebruik Cmd+V in het veld.');
+                                                }
+                                            });
+                                        }
+                                    });
+                                    </script>
+                                </td>
+                            </tr>
                         </table>
 
                         <h2>Kinsta Settings</h2>
@@ -331,6 +412,26 @@ class WP_Static_Exporter {
                                 <td>
                                     <input type="text" id="kinsta_site_id" name="static_exporter_settings[kinsta_site_id]"
                                            value="<?php echo esc_attr($options['kinsta_site_id'] ?? ''); ?>" class="regular-text">
+                                </td>
+                            </tr>
+                        </table>
+
+                        <h2>Export Settings</h2>
+                        <table class="form-table">
+                            <tr>
+                                <th><label for="url_structure">URL Structure</label></th>
+                                <td>
+                                    <label>
+                                        <input type="radio" name="static_exporter_settings[url_structure]"
+                                               value="directory" <?php checked($options['url_structure'] ?? 'directory', 'directory'); ?>>
+                                        Directory style (/page/index.html) - SEO friendly, clean URLs
+                                    </label><br>
+                                    <label>
+                                        <input type="radio" name="static_exporter_settings[url_structure]"
+                                               value="flat" <?php checked($options['url_structure'] ?? 'directory', 'flat'); ?>>
+                                        Flat style (/page.html) - Faster, simpler structure
+                                    </label>
+                                    <p class="description">Choose how URLs are structured in the export</p>
                                 </td>
                             </tr>
                         </table>
@@ -366,6 +467,11 @@ class WP_Static_Exporter {
                 </div>
 
                 <div class="exporter-section">
+                    <h2>Activity Status</h2>
+                    <?php echo $this->render_activity_status(); ?>
+                </div>
+
+                <div class="exporter-section">
                     <h2>Export & Deploy</h2>
 
                     <div class="export-actions">
@@ -380,6 +486,10 @@ class WP_Static_Exporter {
                         <button id="deploy-kinsta" class="button button-secondary button-large" disabled>
                             <span class="dashicons dashicons-cloud-upload"></span> Deploy to Kinsta
                         </button>
+
+                        <button id="reset-lock" class="button button-secondary" style="margin-left: 20px;">
+                            <span class="dashicons dashicons-unlock"></span> Reset Export Lock
+                        </button>
                     </div>
 
                     <div id="export-log" class="export-log"></div>
@@ -390,6 +500,247 @@ class WP_Static_Exporter {
             </div>
         </div>
         <?php
+    }
+
+    /**
+     * Render activity status dashboard
+     */
+    private function render_activity_status() {
+        $last_manual_export = get_option('static_exporter_last_manual_export');
+        $last_auto_export = get_option('static_exporter_last_auto_export');
+        $last_manual_push = get_option('static_exporter_last_manual_push');
+        $last_auto_push = get_option('static_exporter_last_auto_push');
+
+        ob_start();
+        ?>
+        <div class="activity-status-dashboard">
+            <table class="wp-list-table widefat fixed striped">
+                <thead>
+                    <tr>
+                        <th width="20%">Action</th>
+                        <th width="20%">Last Run</th>
+                        <th width="15%">Type</th>
+                        <th width="45%">Details</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <!-- Manual Export -->
+                    <tr>
+                        <td><strong>Export</strong></td>
+                        <td>
+                            <?php if ($last_manual_export): ?>
+                                <span class="dashicons dashicons-clock" style="color: #2271b1;"></span>
+                                <?php echo esc_html(human_time_diff($last_manual_export['timestamp'], current_time('timestamp'))); ?> ago
+                                <br><small><?php echo esc_html(date('Y-m-d H:i:s', $last_manual_export['timestamp'])); ?></small>
+                            <?php else: ?>
+                                <span style="color: #999;">Never</span>
+                            <?php endif; ?>
+                        </td>
+                        <td>
+                            <span class="dashicons dashicons-admin-users"></span> Manual
+                        </td>
+                        <td>
+                            <?php if ($last_manual_export): ?>
+                                <?php if ($last_manual_export['type'] === 'full'): ?>
+                                    <span class="dashicons dashicons-database-export" style="color: #2271b1;"></span>
+                                    <strong>Full export</strong> - All content
+                                <?php else: ?>
+                                    <span class="dashicons dashicons-update" style="color: #46b450;"></span>
+                                    <strong>Incremental</strong> - <?php echo absint($last_manual_export['items_count']); ?> items
+                                <?php endif; ?>
+                                <?php if (!empty($last_manual_export['items'])): ?>
+                                    <br><small style="color: #666;">
+                                        <?php echo esc_html(implode(', ', array_slice($last_manual_export['items'], 0, 3))); ?>
+                                        <?php if (count($last_manual_export['items']) > 3): ?>
+                                            and <?php echo absint(count($last_manual_export['items']) - 3); ?> more...
+                                        <?php endif; ?>
+                                    </small>
+                                <?php endif; ?>
+                            <?php else: ?>
+                                -
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+
+                    <!-- Auto Export -->
+                    <tr>
+                        <td></td>
+                        <td>
+                            <?php if ($last_auto_export): ?>
+                                <span class="dashicons dashicons-clock" style="color: #72aee6;"></span>
+                                <?php echo esc_html(human_time_diff($last_auto_export['timestamp'], current_time('timestamp'))); ?> ago
+                                <br><small><?php echo esc_html(date('Y-m-d H:i:s', $last_auto_export['timestamp'])); ?></small>
+                            <?php else: ?>
+                                <span style="color: #999;">Never</span>
+                            <?php endif; ?>
+                        </td>
+                        <td>
+                            <span class="dashicons dashicons-update-alt"></span> Auto
+                        </td>
+                        <td>
+                            <?php if ($last_auto_export): ?>
+                                <span class="dashicons dashicons-update" style="color: #46b450;"></span>
+                                <?php echo absint($last_auto_export['items_count']); ?> items
+                                <?php if (!empty($last_auto_export['trigger'])): ?>
+                                    <br><small style="color: #666;">Triggered by: <?php echo esc_html($last_auto_export['trigger']); ?></small>
+                                <?php endif; ?>
+                                <?php if (!empty($last_auto_export['items'])): ?>
+                                    <br><small style="color: #666;">
+                                        <?php echo esc_html(implode(', ', array_slice($last_auto_export['items'], 0, 3))); ?>
+                                        <?php if (count($last_auto_export['items']) > 3): ?>
+                                            and <?php echo absint(count($last_auto_export['items']) - 3); ?> more...
+                                        <?php endif; ?>
+                                    </small>
+                                <?php endif; ?>
+                            <?php else: ?>
+                                -
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+
+                    <!-- Manual Push -->
+                    <tr style="border-top: 2px solid #ddd;">
+                        <td><strong>GitHub Push</strong></td>
+                        <td>
+                            <?php if ($last_manual_push): ?>
+                                <span class="dashicons dashicons-clock" style="color: #2271b1;"></span>
+                                <?php echo esc_html(human_time_diff($last_manual_push['timestamp'], current_time('timestamp'))); ?> ago
+                                <br><small><?php echo esc_html(date('Y-m-d H:i:s', $last_manual_push['timestamp'])); ?></small>
+                            <?php else: ?>
+                                <span style="color: #999;">Never</span>
+                            <?php endif; ?>
+                        </td>
+                        <td>
+                            <span class="dashicons dashicons-admin-users"></span> Manual
+                        </td>
+                        <td>
+                            <?php if ($last_manual_push): ?>
+                                <?php if ($last_manual_push['status'] === 'success'): ?>
+                                    <span class="dashicons dashicons-yes" style="color: #46b450;"></span>
+                                    <strong>Success</strong>
+                                <?php else: ?>
+                                    <span class="dashicons dashicons-warning" style="color: #d63638;"></span>
+                                    <strong>No changes</strong>
+                                <?php endif; ?>
+                                <?php if (!empty($last_manual_push['files_count'])): ?>
+                                    - <?php echo absint($last_manual_push['files_count']); ?> files
+                                <?php endif; ?>
+                                <?php if (!empty($last_manual_push['commit'])): ?>
+                                    <br><small style="color: #666;">Commit: <?php echo esc_html(substr($last_manual_push['commit'], 0, 8)); ?></small>
+                                <?php endif; ?>
+                            <?php else: ?>
+                                -
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+
+                    <!-- Auto Push -->
+                    <tr>
+                        <td></td>
+                        <td>
+                            <?php if ($last_auto_push): ?>
+                                <span class="dashicons dashicons-clock" style="color: #72aee6;"></span>
+                                <?php echo esc_html(human_time_diff($last_auto_push['timestamp'], current_time('timestamp'))); ?> ago
+                                <br><small><?php echo esc_html(date('Y-m-d H:i:s', $last_auto_push['timestamp'])); ?></small>
+                            <?php else: ?>
+                                <span style="color: #999;">Never</span>
+                            <?php endif; ?>
+                        </td>
+                        <td>
+                            <span class="dashicons dashicons-update-alt"></span> Auto
+                        </td>
+                        <td>
+                            <?php if ($last_auto_push): ?>
+                                <?php if ($last_auto_push['status'] === 'success'): ?>
+                                    <span class="dashicons dashicons-yes" style="color: #46b450;"></span>
+                                    <strong>Success</strong>
+                                <?php else: ?>
+                                    <span class="dashicons dashicons-warning" style="color: #d63638;"></span>
+                                    <strong>No changes</strong>
+                                <?php endif; ?>
+                                <?php if (!empty($last_auto_push['files_count'])): ?>
+                                    - <?php echo absint($last_auto_push['files_count']); ?> files
+                                <?php endif; ?>
+                            <?php else: ?>
+                                -
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <?php if (!$last_manual_export && !$last_auto_export && !$last_manual_push && !$last_auto_push): ?>
+                <p style="text-align: center; color: #999; padding: 20px;">
+                    <span class="dashicons dashicons-info" style="font-size: 20px;"></span><br>
+                    No activity yet. Click "Export Static Site" to get started!
+                </p>
+            <?php endif; ?>
+        </div>
+
+        <style>
+            .activity-status-dashboard {
+                background: #fff;
+                border: 1px solid #c3c4c7;
+                border-radius: 4px;
+                margin-bottom: 20px;
+            }
+            .activity-status-dashboard table {
+                margin: 0;
+            }
+            .activity-status-dashboard td {
+                padding: 12px 10px;
+            }
+            .activity-status-dashboard .dashicons {
+                vertical-align: middle;
+            }
+        </style>
+        <?php
+        return ob_get_clean();
+    }
+
+    /**
+     * Track export activity for status dashboard
+     */
+    private function track_export_activity($stats, $is_auto = false) {
+        $option_name = $is_auto ? 'static_exporter_last_auto_export' : 'static_exporter_last_manual_export';
+
+        // Determine export type
+        $export_type = 'incremental';
+        $items_count = isset($stats['pages']) ? $stats['pages'] + $stats['posts'] : 0;
+
+        // Get list of exported items (titles)
+        $exported_items = array();
+        if (isset($stats['exported_posts'])) {
+            foreach ($stats['exported_posts'] as $post_id) {
+                $exported_items[] = get_the_title($post_id);
+            }
+        }
+
+        $activity_data = array(
+            'timestamp' => current_time('timestamp'),
+            'type' => $export_type,
+            'items_count' => $items_count,
+            'items' => $exported_items,
+            'trigger' => $is_auto ? ($_POST['trigger'] ?? 'auto') : 'manual'
+        );
+
+        update_option($option_name, $activity_data);
+    }
+
+    /**
+     * Track push activity for status dashboard
+     */
+    private function track_push_activity($result, $is_auto = false) {
+        $option_name = $is_auto ? 'static_exporter_last_auto_push' : 'static_exporter_last_manual_push';
+
+        $activity_data = array(
+            'timestamp' => current_time('timestamp'),
+            'status' => $result['status'] ?? 'success',
+            'files_count' => $result['files_count'] ?? null,
+            'commit' => $result['commit_sha'] ?? null
+        );
+
+        update_option($option_name, $activity_data);
     }
 
     /**
@@ -425,13 +776,16 @@ class WP_Static_Exporter {
                 throw new Exception('Export validation failed: ' . implode(', ', $validation['errors']));
             }
 
+            // Track export activity
+            $this->track_export_activity($validation['stats']);
+
             wp_send_json_success(array(
                 'message' => 'Export completed',
                 'stats' => $validation['stats']
             ));
         } catch (Exception $e) {
             $this->log('Error: ' . $e->getMessage());
-            wp_send_json_error($e->getMessage());
+            wp_send_json_error(esc_html($e->getMessage()));
         }
     }
 
@@ -447,10 +801,12 @@ class WP_Static_Exporter {
             // If we can't check, proceed with warning
             $this->log('Warning: Could not check available disk space');
         } else if ($available_space < self::MAX_EXPORT_SIZE) {
+            $available_mb = absint(round($available_space / 1024 / 1024));
+            $required_mb = absint(round(self::MAX_EXPORT_SIZE / 1024 / 1024));
             throw new Exception(sprintf(
                 'Insufficient disk space. Available: %sMB, Required: ~%sMB',
-                round($available_space / 1024 / 1024),
-                round(self::MAX_EXPORT_SIZE / 1024 / 1024)
+                $available_mb,
+                $required_mb
             ));
         }
 
@@ -610,14 +966,22 @@ class WP_Static_Exporter {
     }
 
     private function do_export() {
+        // PERMANENT TIMEOUT FIX: Set unlimited execution time
+        @ini_set('max_execution_time', '0');
+        @set_time_limit(0); // Unlimited
+        @ignore_user_abort(true); // Continue even if user closes browser
+
+        // Increase memory limit more aggressively
+        @ini_set('memory_limit', '768M'); // Increased from 512M
+
         // Check for concurrent exports using transient lock
         $lock = get_transient('static_export_in_progress');
         if ($lock) {
             throw new Exception('An export is already in progress. Please wait for it to complete.');
         }
 
-        // Set lock
-        set_transient('static_export_in_progress', true, 3600); // 1 hour max
+        // Set lock (increased to 2 hours)
+        set_transient('static_export_in_progress', true, 7200); // 2 hours max
 
         try {
             $this->log('Starting incremental static site export...');
@@ -671,20 +1035,34 @@ class WP_Static_Exporter {
             $pages = get_posts($pages_args);
             $this->log('Found ' . count($pages) . ' ' . ($is_first_export ? '' : 'changed ') . 'pages to export');
 
+            // Get URL structure preference
+            $url_structure = get_option('static_exporter_settings', array())['url_structure'] ?? 'directory';
+
             foreach ($pages as $page) {
                 $url = get_permalink($page->ID);
                 $path = parse_url($url, PHP_URL_PATH);
-                $filename = trim($path, '/') . '/index.html';
+
+                if ($url_structure === 'flat') {
+                    // Flat structure: /about.html
+                    $filename = trim($path, '/') . '.html';
+                } else {
+                    // Directory structure: /about/index.html
+                    $filename = trim($path, '/') . '/index.html';
+                }
+
                 $this->export_page($url, $filename);
                 $exported_count++;
             }
 
-            // Get changed posts (paginated to avoid memory issues)
-            $posts_per_page = 100;
+            // Get changed posts (paginated with SMALLER batches to avoid memory issues)
+            $posts_per_page = self::MAX_POSTS_PER_BATCH; // Now 50 instead of 100
             $offset = 0;
             $total_posts = 0;
 
             while (true) {
+                // Reset time limit for each batch
+                @set_time_limit(180);
+
                 $posts_args = array(
                     'post_type' => 'post',
                     'post_status' => 'publish',
@@ -717,14 +1095,38 @@ class WP_Static_Exporter {
                 }
 
                 foreach ($posts as $post) {
-                    $url = get_permalink($post->ID);
-                    $path = parse_url($url, PHP_URL_PATH);
-                    $filename = trim($path, '/') . '/index.html';
-                    $this->export_page($url, $filename);
-                    $exported_count++;
+                    try {
+                        $url = get_permalink($post->ID);
+                        $path = parse_url($url, PHP_URL_PATH);
+
+                        if ($url_structure === 'flat') {
+                            // Flat structure: /post-name.html
+                            $filename = trim($path, '/') . '.html';
+                        } else {
+                            // Directory structure: /post-name/index.html
+                            $filename = trim($path, '/') . '/index.html';
+                        }
+
+                        $this->export_page($url, $filename);
+                        $exported_count++;
+                    } catch (Exception $e) {
+                        $this->log("⚠ Skipped post {$post->ID}: " . $e->getMessage());
+                        // Continue with other posts
+                    }
+
+                    // Periodic garbage collection
+                    if ($exported_count % 20 === 0) {
+                        gc_collect_cycles();
+                    }
                 }
 
                 $offset += $posts_per_page;
+
+                // Longer delay between batches to prevent timeouts
+                if (!empty($posts) && count($posts) >= $posts_per_page) {
+                    $this->log("Batch complete, short pause before next batch...");
+                    sleep(2); // 2 second pause
+                }
 
                 // Break if we got fewer posts than requested (end of list)
                 if (count($posts) < $posts_per_page) {
@@ -746,6 +1148,9 @@ class WP_Static_Exporter {
             // Create config files
             $this->create_config_files();
 
+            // Retry any failed exports
+            $this->retry_failed_exports();
+
             // Update last export time
             update_option('static_export_last_time', time());
 
@@ -758,39 +1163,145 @@ class WP_Static_Exporter {
     }
 
     private function export_page($url, $filename) {
-        $this->log("Exporting: $url");
+        $max_attempts = 3;
+        $last_error = null;
 
-        $response = wp_remote_get($url, array(
-            'timeout' => self::PAGE_TIMEOUT,
-            'sslverify' => true  // SECURITY FIX: Enable SSL verification
-        ));
+        for ($attempt = 1; $attempt <= $max_attempts; $attempt++) {
+            try {
+                // Reset time limit for each page
+                @set_time_limit(120);
 
-        if (is_wp_error($response)) {
-            throw new Exception("Failed to fetch $url: " . $response->get_error_message());
+                if ($attempt > 1) {
+                    $this->log("Retrying $url (attempt $attempt/$max_attempts)");
+                    sleep(2 * $attempt); // Exponential backoff
+                }
+
+                $this->log("Exporting: $url" . ($attempt > 1 ? " (retry)" : ""));
+
+                $response = wp_remote_get($url, array(
+                    'timeout' => self::PAGE_TIMEOUT,
+                    'sslverify' => true,
+                    'httpversion' => '1.1',
+                    'redirection' => 5,
+                    'blocking' => true
+                ));
+
+                if (is_wp_error($response)) {
+                    $last_error = $response->get_error_message();
+
+                    // If it's a timeout, retry
+                    if (strpos($last_error, 'timed out') !== false ||
+                        strpos($last_error, 'timeout') !== false) {
+                        if ($attempt < $max_attempts) {
+                            continue; // Retry
+                        }
+                    }
+
+                    throw new Exception("Failed to fetch " . esc_url($url) . ": " . esc_html($last_error));
+                }
+
+                $code = wp_remote_retrieve_response_code($response);
+                if ($code !== 200) {
+                    throw new Exception("Failed to fetch " . esc_url($url) . ": HTTP " . absint($code));
+                }
+
+                $html = wp_remote_retrieve_body($response);
+
+                // Make URLs relative
+                $html = $this->make_urls_relative($html);
+
+                // Save file
+                $filepath = $this->export_dir . '/' . $filename;
+                $dir = dirname($filepath);
+
+                if (!file_exists($dir)) {
+                    wp_mkdir_p($dir);
+                }
+
+                $result = @file_put_contents($filepath, $html);
+                if ($result === false) {
+                    throw new Exception("Failed to write file: " . esc_html($filepath));
+                }
+
+                // Success - save checkpoint
+                $this->update_export_checkpoint($filename);
+
+                // Small delay to prevent server overload
+                if (self::EXPORT_PAGE_DELAY > 0) {
+                    usleep(self::EXPORT_PAGE_DELAY * 1000000); // Convert to microseconds
+                }
+
+                return; // Success!
+
+            } catch (Exception $e) {
+                $last_error = $e->getMessage();
+
+                if ($attempt >= $max_attempts) {
+                    // Log failure but don't stop entire export
+                    $this->log("⚠ Failed to export $url after $max_attempts attempts: " . $last_error);
+                    $this->add_failed_export($url, $filename, $last_error);
+                    return; // Continue with other exports
+                }
+            }
+        }
+    }
+
+    /**
+     * Update export checkpoint for resumability
+     */
+    private function update_export_checkpoint($filename) {
+        $checkpoints = get_transient('static_export_checkpoints') ?: array();
+        $checkpoints[] = $filename;
+        set_transient('static_export_checkpoints', $checkpoints, 7200);
+    }
+
+    /**
+     * Track failed exports for retry later
+     */
+    private function add_failed_export($url, $filename, $error) {
+        $failed = get_transient('static_export_failed') ?: array();
+        $failed[] = array(
+            'url' => $url,
+            'filename' => $filename,
+            'error' => $error,
+            'time' => time()
+        );
+        set_transient('static_export_failed', $failed, 7200);
+    }
+
+    /**
+     * Get list of failed exports
+     */
+    private function get_failed_exports() {
+        return get_transient('static_export_failed') ?: array();
+    }
+
+    /**
+     * Retry failed exports (call at end of export)
+     */
+    private function retry_failed_exports() {
+        $failed = $this->get_failed_exports();
+
+        if (empty($failed)) {
+            return;
         }
 
-        $code = wp_remote_retrieve_response_code($response);
-        if ($code !== 200) {
-            throw new Exception("Failed to fetch $url: HTTP $code");
+        $this->log("Retrying " . count($failed) . " failed exports...");
+        $retry_success = 0;
+        $retry_failed = 0;
+
+        foreach ($failed as $export) {
+            try {
+                $this->export_page($export['url'], $export['filename']);
+                $retry_success++;
+            } catch (Exception $e) {
+                $retry_failed++;
+                $this->log("Retry failed for {$export['url']}: " . $e->getMessage());
+            }
         }
 
-        $html = wp_remote_retrieve_body($response);
-
-        // Make URLs relative
-        $html = $this->make_urls_relative($html);
-
-        // Save file
-        $filepath = $this->export_dir . '/' . $filename;
-        $dir = dirname($filepath);
-
-        if (!file_exists($dir)) {
-            wp_mkdir_p($dir);
-        }
-
-        $result = @file_put_contents($filepath, $html);
-        if ($result === false) {
-            throw new Exception("Failed to write file: $filepath");
-        }
+        $this->log("Retry complete: $retry_success succeeded, $retry_failed failed");
+        delete_transient('static_export_failed');
     }
 
     private function make_urls_relative($html) {
@@ -1119,7 +1630,7 @@ class WP_Static_Exporter {
         } catch (Exception $e) {
             $this->log('✗ Initialization failed: ' . $e->getMessage());
             delete_transient('github_push_state');
-            wp_send_json_error($e->getMessage());
+            wp_send_json_error(esc_html($e->getMessage()));
         }
     }
 
@@ -1133,8 +1644,10 @@ class WP_Static_Exporter {
             wp_send_json_error('Unauthorized');
         }
 
-        // Extend execution time for this chunk
-        @set_time_limit(self::CHUNK_TIMEOUT);
+        // PERMANENT FIX: Set unlimited time for chunk processing
+        @set_time_limit(0);
+        @ignore_user_abort(true);
+        @ini_set('max_execution_time', '0');
 
         $chunk_num = isset($_POST['chunk']) ? (int) $_POST['chunk'] : 0;
 
@@ -1193,7 +1706,7 @@ class WP_Static_Exporter {
 
                 $blob_code = wp_remote_retrieve_response_code($blob_response);
                 if ($blob_code !== 201) {
-                    throw new Exception("Failed to create blob for $relative_path");
+                    throw new Exception("Failed to create blob for " . esc_html($relative_path));
                 }
 
                 $blob_data = json_decode(wp_remote_retrieve_body($blob_response), true);
@@ -1228,7 +1741,7 @@ class WP_Static_Exporter {
 
         } catch (Exception $e) {
             $this->log('✗ Chunk upload failed: ' . $e->getMessage());
-            wp_send_json_error($e->getMessage());
+            wp_send_json_error(esc_html($e->getMessage()));
         }
     }
 
@@ -1372,7 +1885,7 @@ class WP_Static_Exporter {
 
         } catch (Exception $e) {
             $this->log('✗ Finalization failed: ' . $e->getMessage());
-            wp_send_json_error($e->getMessage());
+            wp_send_json_error(esc_html($e->getMessage()));
         }
     }
 
@@ -1441,7 +1954,8 @@ class WP_Static_Exporter {
             $this->log("Attempt $attempt failed: $last_error");
         }
 
-        throw new Exception("$context failed after " . self::MAX_RETRIES . " attempts: $last_error");
+        $max_retries = absint(self::MAX_RETRIES);
+        throw new Exception(esc_html($context) . " failed after " . $max_retries . " attempts: " . esc_html($last_error));
     }
 
     private function push_to_github_api($token, $repo, $branch) {
@@ -1464,7 +1978,7 @@ class WP_Static_Exporter {
 
         $user_code = wp_remote_retrieve_response_code($user_response);
         if ($user_code !== 200) {
-            throw new Exception('Invalid GitHub token (code ' . $user_code . '). Please check your token and try again.');
+            throw new Exception('Invalid GitHub token (code ' . absint($user_code) . '). Please check your token and try again.');
         }
 
         // Get the current commit SHA
@@ -1484,7 +1998,7 @@ class WP_Static_Exporter {
         } else if ($response_code !== 200) {
             $error_body = json_decode(wp_remote_retrieve_body($ref_response), true);
             $error_msg = $error_body['message'] ?? 'Unknown error';
-            throw new Exception('GitHub API error: ' . $error_msg);
+            throw new Exception('GitHub API error: ' . esc_html($error_msg));
         }
 
         $ref_data = json_decode(wp_remote_retrieve_body($ref_response), true);
@@ -1571,7 +2085,7 @@ class WP_Static_Exporter {
                     if ($blob_code !== 201) {
                         $blob_body = json_decode(wp_remote_retrieve_body($blob_response), true);
                         $blob_error = $blob_body['message'] ?? 'Unknown error';
-                        throw new Exception("Failed to create blob: $blob_error (code $blob_code)");
+                        throw new Exception("Failed to create blob: " . esc_html($blob_error) . " (code " . absint($blob_code) . ")");
                     }
 
                     $blob_data = json_decode(wp_remote_retrieve_body($blob_response), true);
@@ -1638,7 +2152,7 @@ class WP_Static_Exporter {
         if ($tree_code !== 201) {
             $tree_body = json_decode(wp_remote_retrieve_body($tree_response), true);
             $tree_error = $tree_body['message'] ?? 'Unknown error';
-            throw new Exception('Failed to create tree: ' . $tree_error . ' (code ' . $tree_code . ')');
+            throw new Exception('Failed to create tree: ' . esc_html($tree_error) . ' (code ' . absint($tree_code) . ')');
         }
 
         $tree_data = json_decode(wp_remote_retrieve_body($tree_response), true);
@@ -1677,7 +2191,7 @@ class WP_Static_Exporter {
         if ($commit_code !== 201) {
             $commit_body = json_decode(wp_remote_retrieve_body($commit_response), true);
             $commit_error = $commit_body['message'] ?? 'Unknown error';
-            throw new Exception('Failed to create commit: ' . $commit_error . ' (code ' . $commit_code . ')');
+            throw new Exception('Failed to create commit: ' . esc_html($commit_error) . ' (code ' . absint($commit_code) . ')');
         }
 
         $commit_data = json_decode(wp_remote_retrieve_body($commit_response), true);
@@ -1714,7 +2228,7 @@ class WP_Static_Exporter {
         if ($update_code !== 200) {
             $update_body = json_decode(wp_remote_retrieve_body($update_response), true);
             $update_error = $update_body['message'] ?? 'Unknown error';
-            throw new Exception('Failed to update branch: ' . $update_error . ' (code ' . $update_code . ')');
+            throw new Exception('Failed to update branch: ' . esc_html($update_error) . ' (code ' . absint($update_code) . ')');
         }
 
         $this->log('✓ Successfully pushed to GitHub!');
@@ -1745,7 +2259,172 @@ class WP_Static_Exporter {
             wp_send_json_success(array('message' => 'Deployed to Kinsta'));
         } catch (Exception $e) {
             $this->log('Error: ' . $e->getMessage());
-            wp_send_json_error($e->getMessage());
+            wp_send_json_error(esc_html($e->getMessage()));
+        }
+    }
+
+    /**
+     * Repair Git repository if .git directory is missing
+     */
+    private function repair_git_repository($git_dir) {
+        $this->log('Repairing Git repository...');
+
+        // Get GitHub settings
+        $settings = get_option('static_exporter_settings', array());
+        $github_repo = isset($settings['github_repo']) ? $settings['github_repo'] : '';
+
+        if (empty($github_repo)) {
+            throw new Exception('Cannot repair repository: GitHub repository not configured in settings');
+        }
+
+        $remote_url = 'https://github.com/' . $github_repo . '.git';
+
+        // Initialize Git repository using full path to git
+        $git_bin = '/usr/local/bin/git';
+        $commands = array(
+            'cd ' . escapeshellarg($git_dir),
+            $git_bin . ' init',
+            $git_bin . ' remote add origin ' . escapeshellarg($remote_url),
+            $git_bin . ' branch -M main',
+            $git_bin . ' fetch origin main 2>&1',
+            $git_bin . ' reset --hard origin/main 2>&1'
+        );
+
+        $full_command = implode(' && ', $commands);
+        exec($full_command, $output, $return_code);
+
+        if ($return_code !== 0) {
+            $this->log('Git repair failed: ' . implode("\n", $output));
+            throw new Exception('Failed to repair Git repository. Please check your GitHub settings.');
+        }
+
+        $this->log('✓ Git repository repaired successfully');
+    }
+
+    /**
+     * AJAX handler for Git deployment via shell commands
+     */
+    public function ajax_git_deploy() {
+        check_ajax_referer('static_exporter_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('Unauthorized');
+        }
+
+        $this->log('Starting Git deployment...');
+
+        try {
+            // Change to Git repository directory
+            $git_dir = $this->export_dir;
+
+            if (!file_exists($git_dir . '/.git')) {
+                $this->log('Git repository not found. Attempting to repair...', 'warning');
+                $this->repair_git_repository($git_dir);
+            }
+
+            // Execute git commands using full path to git
+            $git_bin = '/usr/local/bin/git';
+            $commands = array(
+                'cd ' . escapeshellarg($git_dir),
+                $git_bin . ' add -A',
+                $git_bin . ' commit -m "Updated static site - ' . date('Y-m-d H:i') . '"',
+                $git_bin . ' push origin main'
+            );
+
+            $full_command = implode(' && ', $commands) . ' 2>&1';
+            $this->log('Executing: git add, commit, and push...');
+
+            exec($full_command, $output, $return_code);
+
+            $output_text = implode("\n", $output);
+
+            // Always log the Git output for debugging
+            $this->log('Git output: ' . $output_text);
+
+            // Check if there were no changes to commit
+            if (strpos($output_text, 'nothing to commit') !== false) {
+                $this->log('✓ No changes to deploy (already up to date)');
+
+                // Track as "no changes" push
+                $this->track_push_activity(array(
+                    'status' => 'no_changes'
+                ));
+
+                wp_send_json_success(array(
+                    'message' => 'No changes to deploy - site is already up to date',
+                    'output' => $output_text
+                ));
+                return;
+            }
+
+            if ($return_code !== 0) {
+                // Check if it's just a "no changes" situation
+                if (strpos($output_text, 'nothing to commit') === false &&
+                    strpos($output_text, 'Already up to date') === false) {
+                    $this->log('Git command failed with return code: ' . $return_code, 'error');
+                    $this->log('Full output: ' . $output_text, 'error');
+                    throw new Exception('Git command failed (code ' . absint($return_code) . '). Check log for details.');
+                }
+            }
+
+            // Extract commit SHA from git output
+            $commit_sha = null;
+            if (preg_match('/\[main ([a-f0-9]+)\]/', $output_text, $matches)) {
+                $commit_sha = $matches[1];
+            }
+
+            // Count changed files
+            $files_count = null;
+            if (preg_match('/(\d+) files? changed/', $output_text, $matches)) {
+                $files_count = (int)$matches[1];
+            } else if (preg_match('/(\d+) insertion/', $output_text, $matches)) {
+                $files_count = 1; // At least one file if there are insertions
+            }
+
+            $this->log('✓ Successfully pushed to GitHub!');
+            $this->log('Kinsta will automatically deploy in 2-5 minutes');
+
+            // Track successful push
+            $this->track_push_activity(array(
+                'status' => 'success',
+                'commit_sha' => $commit_sha,
+                'files_count' => $files_count
+            ));
+
+            wp_send_json_success(array(
+                'message' => 'Successfully deployed to GitHub! Kinsta will auto-deploy shortly.',
+                'output' => $output_text
+            ));
+
+        } catch (Exception $e) {
+            $this->log('Error: ' . $e->getMessage());
+            wp_send_json_error(esc_html($e->getMessage()));
+        }
+    }
+
+    public function ajax_reset_export_lock() {
+        check_ajax_referer('static_exporter_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('Unauthorized');
+        }
+
+        try {
+            // Clear export lock
+            delete_transient('static_export_in_progress');
+
+            // Clear push state
+            delete_transient('github_push_state');
+
+            // Optionally reset last export time (commented out by default)
+            // delete_option('static_export_last_time');
+
+            wp_send_json_success(array(
+                'message' => 'Export lock cleared successfully. You can now start a new export.'
+            ));
+
+        } catch (Exception $e) {
+            wp_send_json_error(esc_html($e->getMessage()));
         }
     }
 
@@ -1771,7 +2450,7 @@ class WP_Static_Exporter {
         if ($code < 200 || $code >= 300) {
             $body = json_decode(wp_remote_retrieve_body($response), true);
             $error = $body['message'] ?? 'Unknown error';
-            throw new Exception("Kinsta deployment failed: $error (code $code)");
+            throw new Exception("Kinsta deployment failed: " . esc_html($error) . " (code " . absint($code) . ")");
         }
 
         $this->log('✓ Kinsta deployment triggered successfully');
@@ -1987,6 +2666,11 @@ add_action('admin_init', function() use ($wp_static_exporter) {
             // Sanitize branch
             $sanitized['github_branch'] = sanitize_text_field($input['github_branch'] ?? 'main');
 
+            // Sanitize export directory path
+            if (!empty($input['export_directory'])) {
+                $sanitized['export_directory'] = sanitize_text_field($input['export_directory']);
+            }
+
             // Validate and encrypt Kinsta API key if provided
             if (!empty($input['kinsta_api_key'])) {
                 $sanitized['kinsta_api_key_encrypted'] = $wp_static_exporter->encrypt($input['kinsta_api_key']);
@@ -1997,6 +2681,11 @@ add_action('admin_init', function() use ($wp_static_exporter) {
 
             // Sanitize Kinsta site ID
             $sanitized['kinsta_site_id'] = sanitize_text_field($input['kinsta_site_id'] ?? '');
+
+            // Sanitize URL structure
+            $sanitized['url_structure'] = in_array($input['url_structure'] ?? 'directory', array('directory', 'flat'))
+                ? $input['url_structure']
+                : 'directory';
 
             // Checkboxes
             $sanitized['auto_export'] = !empty($input['auto_export']) ? 1 : 0;
