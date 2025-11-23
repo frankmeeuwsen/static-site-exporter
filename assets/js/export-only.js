@@ -2,6 +2,7 @@
  * Export Only - JavaScript Handler
  *
  * Handles the AJAX interactions for the Export Only ZIP download feature.
+ * Uses batched processing to handle large sites without timeout.
  *
  * @package StaticSiteExporter
  * @since 2.6.0
@@ -21,6 +22,14 @@ jQuery(document).ready(function($) {
     const $saveSettingsBtn = $('#export-only-save-settings');
     const $saveStatus = $('#export-only-save-status');
     const $displayBaseUrl = $('#display-base-url');
+
+    // Export state
+    let exportState = {
+        totalItems: 0,
+        totalBatches: 0,
+        currentBatch: 0,
+        isRunning: false
+    };
 
     /**
      * Log a message to the export log
@@ -88,9 +97,144 @@ jQuery(document).ready(function($) {
     }
 
     /**
-     * Start export generation
+     * Initialize export - count items and prepare batches
      */
-    $startBtn.on('click', function() {
+    function initExport() {
+        return new Promise(function(resolve, reject) {
+            $.ajax({
+                url: staticExporter.ajax_url,
+                type: 'POST',
+                data: {
+                    action: 'export_only_init',
+                    nonce: staticExporter.nonce
+                },
+                timeout: 60000,
+                success: function(response) {
+                    if (response.success) {
+                        exportState.totalItems = response.data.total_items;
+                        exportState.totalBatches = response.data.total_batches;
+                        exportState.currentBatch = 0;
+
+                        log('Export geinitialiseerd: ' + response.data.total_pages + ' pagina\'s, ' +
+                            response.data.total_posts + ' posts', 'info');
+                        log('Verwerken in ' + response.data.total_batches + ' batches van ' +
+                            response.data.batch_size + ' items', 'info');
+
+                        resolve(response.data);
+                    } else {
+                        reject(response.data || 'Initialisatie mislukt');
+                    }
+                },
+                error: function(xhr, status, error) {
+                    reject('Initialisatie mislukt: ' + error);
+                }
+            });
+        });
+    }
+
+    /**
+     * Process a single batch
+     */
+    function processBatch(batchNum) {
+        return new Promise(function(resolve, reject) {
+            $.ajax({
+                url: staticExporter.ajax_url,
+                type: 'POST',
+                data: {
+                    action: 'export_only_batch',
+                    nonce: staticExporter.nonce,
+                    batch: batchNum
+                },
+                timeout: 120000, // 2 minutes per batch
+                success: function(response) {
+                    if (response.success) {
+                        // Log batch messages
+                        if (response.data.log) {
+                            response.data.log.forEach(function(msg) {
+                                log('  ' + msg, 'info');
+                            });
+                        }
+
+                        // Update progress
+                        const percent = Math.round((response.data.processed / exportState.totalItems) * 80) + 10;
+                        updateProgress(percent, 'Batch ' + (batchNum + 1) + '/' + exportState.totalBatches);
+
+                        // Update live stats
+                        updateStats(response.data.stats);
+
+                        resolve(response.data);
+                    } else {
+                        reject(response.data || 'Batch verwerking mislukt');
+                    }
+                },
+                error: function(xhr, status, error) {
+                    if (status === 'timeout') {
+                        reject('Batch ' + (batchNum + 1) + ' timeout - probeer opnieuw');
+                    } else {
+                        reject('Batch ' + (batchNum + 1) + ' mislukt: ' + error);
+                    }
+                }
+            });
+        });
+    }
+
+    /**
+     * Process all batches sequentially
+     */
+    async function processAllBatches() {
+        for (let i = 0; i < exportState.totalBatches; i++) {
+            if (!exportState.isRunning) {
+                throw new Error('Export geannuleerd');
+            }
+
+            log('Verwerken batch ' + (i + 1) + '/' + exportState.totalBatches + '...', 'info');
+
+            const result = await processBatch(i);
+
+            if (result.done) {
+                break;
+            }
+        }
+    }
+
+    /**
+     * Finalize export - generate extra files and create ZIP
+     */
+    function finalizeExport() {
+        return new Promise(function(resolve, reject) {
+            $.ajax({
+                url: staticExporter.ajax_url,
+                type: 'POST',
+                data: {
+                    action: 'export_only_finalize',
+                    nonce: staticExporter.nonce
+                },
+                timeout: 120000, // 2 minutes for finalization
+                success: function(response) {
+                    if (response.success) {
+                        // Log finalization messages
+                        if (response.data.log) {
+                            response.data.log.forEach(function(msg) {
+                                log(msg, 'info');
+                            });
+                        }
+
+                        resolve(response.data);
+                    } else {
+                        reject(response.data.message || 'Finalisatie mislukt');
+                    }
+                },
+                error: function(xhr, status, error) {
+                    reject('Finalisatie mislukt: ' + error);
+                }
+            });
+        });
+    }
+
+    /**
+     * Start export generation (batched)
+     */
+    $startBtn.on('click', async function() {
         // Clear previous state
         $log.empty();
         $stats.hide();
@@ -98,78 +242,42 @@ jQuery(document).ready(function($) {
 
         log('Start export generatie...', 'info');
         setButtonLoading($startBtn, true);
-        updateProgress(10, 'Voorbereiden...');
+        updateProgress(5, 'Initialiseren...');
 
-        $.ajax({
-            url: staticExporter.ajax_url,
-            type: 'POST',
-            data: {
-                action: 'export_only_generate',
-                nonce: staticExporter.nonce
-            },
-            timeout: 300000, // 5 minutes
-            xhr: function() {
-                const xhr = new window.XMLHttpRequest();
-                // Progress simulation
-                let progress = 10;
-                const progressInterval = setInterval(function() {
-                    if (progress < 90) {
-                        progress += Math.random() * 5;
-                        updateProgress(Math.min(progress, 90), 'Exporteren...');
-                    }
-                }, 1000);
+        exportState.isRunning = true;
 
-                xhr.onload = function() {
-                    clearInterval(progressInterval);
-                };
+        try {
+            // Step 1: Initialize
+            await initExport();
+            updateProgress(10, 'Exporteren...');
 
-                return xhr;
-            },
-            success: function(response) {
-                updateProgress(100, 'Voltooid!');
+            // Step 2: Process all batches
+            await processAllBatches();
+            updateProgress(90, 'Finaliseren...');
 
-                if (response.success) {
-                    // Show log messages from server
-                    if (response.data.log) {
-                        response.data.log.forEach(function(msg) {
-                            log(msg, 'info');
-                        });
-                    }
+            // Step 3: Finalize
+            log('Finaliseren van export...', 'info');
+            const finalResult = await finalizeExport();
 
-                    log('Export succesvol gegenereerd!', 'success');
+            // Done!
+            updateProgress(100, 'Voltooid!');
+            log('Export succesvol gegenereerd!', 'success');
 
-                    // Update stats
-                    updateStats(response.data.stats);
+            // Update final stats
+            updateStats(finalResult.stats);
 
-                    // Show download button
-                    $downloadBtn.show();
+            // Show download button
+            $downloadBtn.show();
 
-                    hideProgress();
-                } else {
-                    log('Export mislukt: ' + (response.data.message || 'Onbekende fout'), 'error');
+            hideProgress();
 
-                    if (response.data.log) {
-                        response.data.log.forEach(function(msg) {
-                            log(msg, 'error');
-                        });
-                    }
-
-                    hideProgress();
-                }
-            },
-            error: function(xhr, status, error) {
-                log('Export mislukt: ' + error, 'error');
-
-                if (status === 'timeout') {
-                    log('De export duurde te lang. Probeer het opnieuw of neem contact op met de beheerder.', 'error');
-                }
-
-                hideProgress();
-            },
-            complete: function() {
-                setButtonLoading($startBtn, false);
-            }
-        });
+        } catch (error) {
+            log('Export mislukt: ' + (error.message || error), 'error');
+            hideProgress();
+        } finally {
+            exportState.isRunning = false;
+            setButtonLoading($startBtn, false);
+        }
     });
 
     /**

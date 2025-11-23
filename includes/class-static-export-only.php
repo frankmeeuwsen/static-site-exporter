@@ -5,6 +5,8 @@
  * Exports WordPress site to static HTML as a ZIP download.
  * No deployment, no Git - just a clean static export.
  *
+ * Uses batched processing to handle large sites without timeout.
+ *
  * @package StaticSiteExporter
  * @since 2.6.0
  */
@@ -21,6 +23,9 @@ class Static_Export_Only {
 
     /** @var string Temporary directory for export */
     private $temp_dir;
+
+    /** @var int Batch size for processing */
+    private $batch_size = 25;
 
     /** @var array Export statistics */
     private $stats = [
@@ -40,7 +45,12 @@ class Static_Export_Only {
         // Get base URL from settings or use default
         $this->base_url = get_option('export_only_base_url', $this->default_base_url);
 
-        add_action('wp_ajax_export_only_generate', [$this, 'ajax_generate_export']);
+        // Batched export handlers
+        add_action('wp_ajax_export_only_init', [$this, 'ajax_export_init']);
+        add_action('wp_ajax_export_only_batch', [$this, 'ajax_export_batch']);
+        add_action('wp_ajax_export_only_finalize', [$this, 'ajax_export_finalize']);
+
+        // Other handlers
         add_action('wp_ajax_export_only_download', [$this, 'ajax_download_zip']);
         add_action('wp_ajax_export_only_status', [$this, 'ajax_get_status']);
         add_action('wp_ajax_export_only_cleanup', [$this, 'ajax_cleanup']);
@@ -174,55 +184,219 @@ class Static_Export_Only {
     }
 
     /**
-     * AJAX handler: Generate the static export
+     * AJAX handler: Initialize export - count items and prepare batches
      */
-    public function ajax_generate_export() {
+    public function ajax_export_init() {
         check_ajax_referer('static_exporter_nonce', 'nonce');
 
         if (!current_user_can('manage_options')) {
             wp_send_json_error('Unauthorized');
         }
 
+        // Clean up any previous export
+        $this->cleanup_temp_files();
+
         // Set up temp directory
         $this->temp_dir = WP_CONTENT_DIR . '/static-export-zip-' . time();
         update_option('export_only_temp_dir', $this->temp_dir);
 
-        try {
-            // Create temp directory
-            if (!wp_mkdir_p($this->temp_dir)) {
-                throw new Exception('Kon tijdelijke directory niet aanmaken');
+        // Create temp directory
+        if (!wp_mkdir_p($this->temp_dir)) {
+            wp_send_json_error('Kon tijdelijke directory niet aanmaken');
+        }
+
+        // Count pages and posts
+        $pages = get_posts([
+            'post_type' => 'page',
+            'post_status' => 'publish',
+            'posts_per_page' => -1,
+            'fields' => 'ids'
+        ]);
+
+        $posts = get_posts([
+            'post_type' => 'post',
+            'post_status' => 'publish',
+            'posts_per_page' => -1,
+            'fields' => 'ids'
+        ]);
+
+        $total_pages = count($pages);
+        $total_posts = count($posts);
+        $total_items = $total_pages + $total_posts + 1; // +1 for homepage
+
+        // Calculate batches
+        $total_batches = ceil($total_items / $this->batch_size);
+
+        // Store export state
+        $export_state = [
+            'temp_dir' => $this->temp_dir,
+            'page_ids' => $pages,
+            'post_ids' => $posts,
+            'total_pages' => $total_pages,
+            'total_posts' => $total_posts,
+            'total_items' => $total_items,
+            'total_batches' => max(1, $total_batches),
+            'current_batch' => 0,
+            'processed' => 0,
+            'stats' => [
+                'pages' => 0,
+                'posts' => 0,
+                'files' => 0,
+                'size' => 0
+            ]
+        ];
+
+        update_option('export_only_state', $export_state);
+
+        wp_send_json_success([
+            'message' => 'Export geinitialiseerd',
+            'total_pages' => $total_pages,
+            'total_posts' => $total_posts,
+            'total_items' => $total_items,
+            'total_batches' => $export_state['total_batches'],
+            'batch_size' => $this->batch_size
+        ]);
+    }
+
+    /**
+     * AJAX handler: Process a batch of items
+     */
+    public function ajax_export_batch() {
+        check_ajax_referer('static_exporter_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('Unauthorized');
+        }
+
+        // Get export state
+        $state = get_option('export_only_state');
+        if (!$state) {
+            wp_send_json_error('Export niet geinitialiseerd. Start opnieuw.');
+        }
+
+        $this->temp_dir = $state['temp_dir'];
+        $batch_num = isset($_POST['batch']) ? intval($_POST['batch']) : 0;
+
+        // Calculate which items to process in this batch
+        $start_index = $batch_num * $this->batch_size;
+        $items_to_process = [];
+        $log_messages = [];
+
+        // First, handle homepage in batch 0
+        if ($batch_num === 0) {
+            $homepage_result = $this->export_homepage();
+            if ($homepage_result) {
+                $log_messages[] = 'Homepage geexporteerd';
             }
+            $start_index = 0; // Start processing pages/posts from 0
+        }
 
-            $this->log('Start export generatie...');
+        // Combine page and post IDs
+        $all_ids = array_merge(
+            array_map(function($id) { return ['type' => 'page', 'id' => $id]; }, $state['page_ids']),
+            array_map(function($id) { return ['type' => 'post', 'id' => $id]; }, $state['post_ids'])
+        );
 
-            // Step 1: Export all pages
-            $this->log('Exporteren van pagina\'s...');
-            $this->export_pages();
+        // Adjust start index for homepage
+        $adjusted_start = ($batch_num === 0) ? 0 : ($start_index - 1);
+        $items_in_batch = array_slice($all_ids, $adjusted_start, $this->batch_size);
 
-            // Step 2: Export all posts
-            $this->log('Exporteren van posts...');
-            $this->export_posts();
+        $pages_processed = 0;
+        $posts_processed = 0;
 
-            // Step 3: Export homepage
-            $this->log('Exporteren van homepage...');
-            $this->export_homepage();
+        foreach ($items_in_batch as $item) {
+            $post = get_post($item['id']);
+            if (!$post) continue;
 
-            // Step 4: Generate extra files
-            $this->log('Genereren van extra bestanden...');
+            $result = $this->export_single_content($post);
+
+            if ($item['type'] === 'page') {
+                $pages_processed++;
+                $state['stats']['pages']++;
+            } else {
+                $posts_processed++;
+                $state['stats']['posts']++;
+            }
+        }
+
+        if ($pages_processed > 0) {
+            $log_messages[] = "{$pages_processed} pagina's geexporteerd";
+        }
+        if ($posts_processed > 0) {
+            $log_messages[] = "{$posts_processed} posts geexporteerd";
+        }
+
+        // Update state
+        $state['current_batch'] = $batch_num + 1;
+        $state['processed'] += count($items_in_batch) + ($batch_num === 0 ? 1 : 0);
+        update_option('export_only_state', $state);
+
+        // Check if more batches needed
+        $all_done = $state['current_batch'] >= $state['total_batches'];
+
+        wp_send_json_success([
+            'batch' => $batch_num,
+            'processed' => $state['processed'],
+            'total' => $state['total_items'],
+            'done' => $all_done,
+            'next_batch' => $all_done ? null : $batch_num + 1,
+            'log' => $log_messages,
+            'stats' => $state['stats']
+        ]);
+    }
+
+    /**
+     * AJAX handler: Finalize export - generate extra files and create ZIP
+     */
+    public function ajax_export_finalize() {
+        check_ajax_referer('static_exporter_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('Unauthorized');
+        }
+
+        // Get export state
+        $state = get_option('export_only_state');
+        if (!$state) {
+            wp_send_json_error('Export niet geinitialiseerd. Start opnieuw.');
+        }
+
+        $this->temp_dir = $state['temp_dir'];
+        $this->stats = $state['stats'];
+        $log_messages = [];
+
+        try {
+            // Generate extra files
+            $log_messages[] = 'Genereren van extra bestanden...';
+
             $this->generate_sitemap();
+            $log_messages[] = '  sitemap.xml gegenereerd';
+
             $this->generate_robots();
+            $log_messages[] = '  robots.txt gegenereerd';
+
             $this->generate_manifest();
+            $log_messages[] = '  manifest.json gegenereerd';
+
             $this->generate_service_worker();
+            $log_messages[] = '  sw.js (service worker) gegenereerd';
+
             $this->generate_offline_page();
+            $log_messages[] = '  offline.html gegenereerd';
+
             $this->generate_404_page();
+            $log_messages[] = '  404.html gegenereerd';
+
             $this->generate_redirects();
+            $log_messages[] = '  _redirects gegenereerd';
 
-            // Step 5: Copy theme CSS/JS (not images)
-            $this->log('Kopieren van theme assets...');
+            // Copy theme assets
+            $log_messages[] = 'Kopieren van theme assets...';
             $this->copy_theme_assets();
+            $log_messages[] = '  Theme assets gekopieerd';
 
-            // Step 6: Create ZIP
-            $this->log('Maken van ZIP archief...');
+            // Create ZIP
+            $log_messages[] = 'Maken van ZIP archief...';
             $zip_path = $this->create_zip();
 
             // Calculate final stats
@@ -232,19 +406,18 @@ class Static_Export_Only {
             update_option('export_only_zip_path', $zip_path);
             update_option('export_only_stats', $this->stats);
 
-            $this->log('Export voltooid!');
+            $log_messages[] = 'Export voltooid!';
 
             wp_send_json_success([
                 'message' => 'Export succesvol gegenereerd',
                 'stats' => $this->stats,
-                'log' => $this->log
+                'log' => $log_messages
             ]);
 
         } catch (Exception $e) {
-            $this->log('FOUT: ' . $e->getMessage());
             wp_send_json_error([
                 'message' => $e->getMessage(),
-                'log' => $this->log
+                'log' => $log_messages
             ]);
         }
     }
@@ -341,46 +514,6 @@ class Static_Export_Only {
     }
 
     /**
-     * Export all published pages
-     */
-    private function export_pages() {
-        $pages = get_posts([
-            'post_type' => 'page',
-            'post_status' => 'publish',
-            'posts_per_page' => -1,
-            'orderby' => 'menu_order',
-            'order' => 'ASC'
-        ]);
-
-        foreach ($pages as $page) {
-            $this->export_single_content($page);
-            $this->stats['pages']++;
-        }
-
-        $this->log("  {$this->stats['pages']} pagina's geexporteerd");
-    }
-
-    /**
-     * Export all published posts
-     */
-    private function export_posts() {
-        $posts = get_posts([
-            'post_type' => 'post',
-            'post_status' => 'publish',
-            'posts_per_page' => -1,
-            'orderby' => 'date',
-            'order' => 'DESC'
-        ]);
-
-        foreach ($posts as $post) {
-            $this->export_single_content($post);
-            $this->stats['posts']++;
-        }
-
-        $this->log("  {$this->stats['posts']} posts geexporteerd");
-    }
-
-    /**
      * Export the homepage
      */
     private function export_homepage() {
@@ -390,8 +523,9 @@ class Static_Export_Only {
         if ($html) {
             $html = $this->transform_html($html);
             $this->save_file('index.html', $html);
-            $this->log('  Homepage geexporteerd');
+            return true;
         }
+        return false;
     }
 
     /**
@@ -402,8 +536,7 @@ class Static_Export_Only {
         $html = $this->fetch_url($url);
 
         if (!$html) {
-            $this->log("  WAARSCHUWING: Kon niet ophalen: {$post->post_title}");
-            return;
+            return false;
         }
 
         // Transform HTML
@@ -412,6 +545,8 @@ class Static_Export_Only {
         // Determine file path based on URL structure
         $path = $this->url_to_path($url);
         $this->save_file($path, $html);
+
+        return true;
     }
 
     /**
@@ -424,7 +559,7 @@ class Static_Export_Only {
         }
 
         $response = wp_remote_get($url, [
-            'timeout' => 60,
+            'timeout' => 30,
             'sslverify' => false,
             'httpversion' => '1.1',
             'redirection' => 5,
@@ -572,11 +707,11 @@ class Static_Export_Only {
         }
 
         // Fix protocol-relative URLs
-        $html = preg_replace('/(?<=["\'])\/{2,}(?=[^\/])/', 'https://', $html);
+        $html = preg_replace('/(?<=["\']\/{2,}(?=[^\/])/', 'https://', $html);
 
         // Fix empty href/src
-        $html = preg_replace('/href=["\'][\s]*["\']/', 'href="/"', $html);
-        $html = preg_replace('/src=["\'][\s]*["\']/', 'src="/"', $html);
+        $html = preg_replace('/href=["\']\s*["\']/', 'href="/"', $html);
+        $html = preg_replace('/src=["\']\s*["\']/', 'src="/"', $html);
 
         // Ensure wp-content paths start with /
         $html = preg_replace('/(?<=["\'])wp-content/', '/wp-content', $html);
@@ -748,7 +883,6 @@ class Static_Export_Only {
         $xml .= '</urlset>';
 
         $this->save_file('sitemap.xml', $xml);
-        $this->log('  sitemap.xml gegenereerd');
     }
 
     /**
@@ -762,7 +896,6 @@ class Static_Export_Only {
         $robots .= "Sitemap: {$this->base_url}/sitemap.xml\n";
 
         $this->save_file('robots.txt', $robots);
-        $this->log('  robots.txt gegenereerd');
     }
 
     /**
@@ -795,7 +928,6 @@ class Static_Export_Only {
         ];
 
         $this->save_file('manifest.json', wp_json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-        $this->log('  manifest.json gegenereerd');
     }
 
     /**
@@ -863,7 +995,6 @@ self.addEventListener('fetch', event => {
 JS;
 
         $this->save_file('sw.js', $sw);
-        $this->log('  sw.js (service worker) gegenereerd');
     }
 
     /**
@@ -939,7 +1070,6 @@ JS;
 HTML;
 
         $this->save_file('offline.html', $html);
-        $this->log('  offline.html gegenereerd');
     }
 
     /**
@@ -1019,7 +1149,6 @@ HTML;
 HTML;
 
         $this->save_file('404.html', $html);
-        $this->log('  404.html gegenereerd');
     }
 
     /**
@@ -1032,7 +1161,6 @@ HTML;
         $redirects .= "/* /404.html 404\n";
 
         $this->save_file('_redirects', $redirects);
-        $this->log('  _redirects gegenereerd');
     }
 
     /**
@@ -1047,7 +1175,6 @@ HTML;
         $allowed_extensions = ['css', 'js', 'woff', 'woff2', 'ttf', 'eot', 'svg'];
 
         $this->copy_filtered_directory($theme_dir, $dest_dir, $allowed_extensions);
-        $this->log('  Theme assets gekopieerd');
     }
 
     /**
@@ -1146,6 +1273,7 @@ HTML;
         delete_option('export_only_temp_dir');
         delete_option('export_only_zip_path');
         delete_option('export_only_stats');
+        delete_option('export_only_state');
     }
 
     /**
