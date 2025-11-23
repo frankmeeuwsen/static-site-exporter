@@ -14,7 +14,10 @@ if (!defined('ABSPATH')) exit;
 class Static_Export_Only {
 
     /** @var string Base URL for the site */
-    private $base_url = 'https://diggingthedigital.com';
+    private $base_url;
+
+    /** @var string Default base URL */
+    private $default_base_url = 'https://diggingthedigital.com';
 
     /** @var string Temporary directory for export */
     private $temp_dir;
@@ -34,10 +37,14 @@ class Static_Export_Only {
      * Constructor - register hooks
      */
     public function __construct() {
+        // Get base URL from settings or use default
+        $this->base_url = get_option('export_only_base_url', $this->default_base_url);
+
         add_action('wp_ajax_export_only_generate', [$this, 'ajax_generate_export']);
         add_action('wp_ajax_export_only_download', [$this, 'ajax_download_zip']);
         add_action('wp_ajax_export_only_status', [$this, 'ajax_get_status']);
         add_action('wp_ajax_export_only_cleanup', [$this, 'ajax_cleanup']);
+        add_action('wp_ajax_export_only_save_settings', [$this, 'ajax_save_settings']);
     }
 
     /**
@@ -56,12 +63,38 @@ class Static_Export_Only {
                 </p>
             </div>
 
+            <!-- Settings Section -->
+            <div class="export-only-settings" style="margin-bottom: 25px; padding: 15px; background: #f8f9fa; border: 1px solid #e2e4e7; border-radius: 4px;">
+                <h3 style="margin: 0 0 15px 0; font-size: 14px;">Instellingen</h3>
+                <table class="form-table" style="margin: 0;">
+                    <tr>
+                        <th scope="row" style="padding: 10px 10px 10px 0; width: 150px;">
+                            <label for="export-only-base-url">Base URL</label>
+                        </th>
+                        <td style="padding: 10px 0;">
+                            <input type="url" id="export-only-base-url" class="regular-text"
+                                   value="<?php echo esc_attr($this->base_url); ?>"
+                                   placeholder="https://example.com"
+                                   style="width: 350px;">
+                            <button type="button" id="export-only-save-settings" class="button" style="margin-left: 10px;">
+                                Opslaan
+                            </button>
+                            <span id="export-only-save-status" style="margin-left: 10px; display: none;"></span>
+                            <p class="description" style="margin-top: 8px;">
+                                De productie URL voor je statische site. Wordt gebruikt in sitemap.xml, manifest.json, etc.
+                                <br><small>Huidige WordPress URL: <code><?php echo esc_html($site_url); ?></code></small>
+                            </p>
+                        </td>
+                    </tr>
+                </table>
+            </div>
+
             <div class="export-only-info">
                 <table class="widefat striped">
                     <tbody>
                         <tr>
                             <td><strong>Base URL</strong></td>
-                            <td><code><?php echo esc_html($this->base_url); ?></code></td>
+                            <td><code id="display-base-url"><?php echo esc_html($this->base_url); ?></code></td>
                         </tr>
                         <tr>
                             <td><strong>Wat wordt geexporteerd</strong></td>
@@ -273,6 +306,38 @@ class Static_Export_Only {
 
         $this->cleanup_temp_files();
         wp_send_json_success('Cleanup voltooid');
+    }
+
+    /**
+     * AJAX handler: Save settings
+     */
+    public function ajax_save_settings() {
+        check_ajax_referer('static_exporter_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('Unauthorized');
+        }
+
+        $base_url = isset($_POST['base_url']) ? esc_url_raw(trim($_POST['base_url'])) : '';
+
+        // Validate URL
+        if (empty($base_url)) {
+            wp_send_json_error('Base URL is verplicht');
+        }
+
+        // Remove trailing slash for consistency
+        $base_url = rtrim($base_url, '/');
+
+        // Save to options
+        update_option('export_only_base_url', $base_url);
+
+        // Update instance variable
+        $this->base_url = $base_url;
+
+        wp_send_json_success([
+            'message' => 'Instellingen opgeslagen',
+            'base_url' => $base_url
+        ]);
     }
 
     /**

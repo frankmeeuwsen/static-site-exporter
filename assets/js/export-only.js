@@ -17,6 +17,10 @@ jQuery(document).ready(function($) {
     const $progressText = $progress.find('.progress-text');
     const $log = $('#export-only-log');
     const $stats = $('#export-only-stats');
+    const $baseUrlInput = $('#export-only-base-url');
+    const $saveSettingsBtn = $('#export-only-save-settings');
+    const $saveStatus = $('#export-only-save-status');
+    const $displayBaseUrl = $('#display-base-url');
 
     /**
      * Log a message to the export log
@@ -203,6 +207,55 @@ jQuery(document).ready(function($) {
             $downloadBtn.hide();
             $stats.hide();
         }, 2000);
+    });
+
+    /**
+     * Save settings (Base URL)
+     */
+    $saveSettingsBtn.on('click', function() {
+        const baseUrl = $baseUrlInput.val().trim();
+
+        if (!baseUrl) {
+            $saveStatus.text('Base URL is verplicht').css('color', '#d63638').show();
+            return;
+        }
+
+        // Basic URL validation
+        if (!baseUrl.match(/^https?:\/\/.+/)) {
+            $saveStatus.text('Voer een geldige URL in (met http:// of https://)').css('color', '#d63638').show();
+            return;
+        }
+
+        $saveSettingsBtn.prop('disabled', true);
+        $saveStatus.text('Opslaan...').css('color', '#666').show();
+
+        $.ajax({
+            url: staticExporter.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'export_only_save_settings',
+                nonce: staticExporter.nonce,
+                base_url: baseUrl
+            },
+            success: function(response) {
+                if (response.success) {
+                    $saveStatus.text('✓ Opgeslagen').css('color', '#00a32a').show();
+                    // Update the display in the info table
+                    $displayBaseUrl.text(response.data.base_url);
+                    setTimeout(function() {
+                        $saveStatus.fadeOut();
+                    }, 3000);
+                } else {
+                    $saveStatus.text('✗ ' + (response.data || 'Fout bij opslaan')).css('color', '#d63638').show();
+                }
+            },
+            error: function(xhr, status, error) {
+                $saveStatus.text('✗ Fout: ' + error).css('color', '#d63638').show();
+            },
+            complete: function() {
+                $saveSettingsBtn.prop('disabled', false);
+            }
+        });
     });
 
     // Add CSS for spinning animation
