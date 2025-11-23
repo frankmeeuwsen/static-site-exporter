@@ -155,6 +155,18 @@ jQuery(document).ready(function($) {
                             });
                         }
 
+                        // Log any errors/warnings
+                        if (response.data.errors && response.data.errors.length > 0) {
+                            response.data.errors.forEach(function(err) {
+                                log('  ⚠ ' + err, 'error');
+                            });
+                        }
+
+                        // Log memory usage (debug)
+                        if (response.data.memory_used) {
+                            log('  [Debug] Memory: ' + response.data.memory_used + ' (peak: ' + response.data.memory_peak + ')', 'info');
+                        }
+
                         // Update progress
                         const percent = Math.round((response.data.processed / exportState.totalItems) * 80) + 10;
                         updateProgress(percent, 'Batch ' + (batchNum + 1) + '/' + exportState.totalBatches);
@@ -164,15 +176,45 @@ jQuery(document).ready(function($) {
 
                         resolve(response.data);
                     } else {
-                        reject(response.data || 'Batch verwerking mislukt');
+                        // Extract detailed error message
+                        let errorMsg = 'Batch verwerking mislukt';
+                        if (response.data) {
+                            if (typeof response.data === 'string') {
+                                errorMsg = response.data;
+                            } else if (response.data.message) {
+                                errorMsg = response.data.message;
+                                if (response.data.file) {
+                                    errorMsg += ' in ' + response.data.file + ':' + response.data.line;
+                                }
+                            }
+                        }
+                        reject(errorMsg);
                     }
                 },
                 error: function(xhr, status, error) {
+                    let errorMsg = 'Batch ' + (batchNum + 1) + ' mislukt: ';
                     if (status === 'timeout') {
-                        reject('Batch ' + (batchNum + 1) + ' timeout - probeer opnieuw');
+                        errorMsg = 'Batch ' + (batchNum + 1) + ' timeout - de server reageerde niet binnen 2 minuten';
+                    } else if (xhr.responseJSON && xhr.responseJSON.data) {
+                        if (xhr.responseJSON.data.message) {
+                            errorMsg += xhr.responseJSON.data.message;
+                        } else {
+                            errorMsg += JSON.stringify(xhr.responseJSON.data);
+                        }
+                    } else if (xhr.responseText) {
+                        // Try to extract error from HTML response
+                        const match = xhr.responseText.match(/<b>Fatal error<\/b>:(.+?)in/i);
+                        if (match) {
+                            errorMsg += 'PHP Fatal: ' + match[1].trim();
+                        } else if (xhr.responseText.length < 500) {
+                            errorMsg += xhr.responseText;
+                        } else {
+                            errorMsg += error || status;
+                        }
                     } else {
-                        reject('Batch ' + (batchNum + 1) + ' mislukt: ' + error);
+                        errorMsg += error || status || 'onbekende fout';
                     }
+                    reject(errorMsg);
                 }
             });
         });

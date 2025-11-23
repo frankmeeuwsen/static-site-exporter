@@ -265,84 +265,146 @@ class Static_Export_Only {
         check_ajax_referer('static_exporter_nonce', 'nonce');
 
         if (!current_user_can('manage_options')) {
-            wp_send_json_error('Unauthorized');
+            wp_send_json_error(['message' => 'Unauthorized']);
         }
 
-        // Get export state
-        $state = get_option('export_only_state');
-        if (!$state) {
-            wp_send_json_error('Export niet geinitialiseerd. Start opnieuw.');
-        }
+        // Increase memory and time limits for batch processing
+        @ini_set('memory_limit', '512M');
+        @set_time_limit(120);
 
-        $this->temp_dir = $state['temp_dir'];
-        $batch_num = isset($_POST['batch']) ? intval($_POST['batch']) : 0;
-
-        // Calculate which items to process in this batch
-        $start_index = $batch_num * $this->batch_size;
-        $items_to_process = [];
-        $log_messages = [];
-
-        // First, handle homepage in batch 0
-        if ($batch_num === 0) {
-            $homepage_result = $this->export_homepage();
-            if ($homepage_result) {
-                $log_messages[] = 'Homepage geexporteerd';
+        try {
+            // Get export state
+            $state = get_option('export_only_state');
+            if (!$state) {
+                wp_send_json_error(['message' => 'Export niet geinitialiseerd. Start opnieuw.']);
             }
-            $start_index = 0; // Start processing pages/posts from 0
-        }
 
-        // Combine page and post IDs
-        $all_ids = array_merge(
-            array_map(function($id) { return ['type' => 'page', 'id' => $id]; }, $state['page_ids']),
-            array_map(function($id) { return ['type' => 'post', 'id' => $id]; }, $state['post_ids'])
-        );
+            $this->temp_dir = $state['temp_dir'];
 
-        // Adjust start index for homepage
-        $adjusted_start = ($batch_num === 0) ? 0 : ($start_index - 1);
-        $items_in_batch = array_slice($all_ids, $adjusted_start, $this->batch_size);
-
-        $pages_processed = 0;
-        $posts_processed = 0;
-
-        foreach ($items_in_batch as $item) {
-            $post = get_post($item['id']);
-            if (!$post) continue;
-
-            $result = $this->export_single_content($post);
-
-            if ($item['type'] === 'page') {
-                $pages_processed++;
-                $state['stats']['pages']++;
-            } else {
-                $posts_processed++;
-                $state['stats']['posts']++;
+            // Verify temp directory exists
+            if (!is_dir($this->temp_dir)) {
+                wp_send_json_error(['message' => 'Temp directory bestaat niet meer: ' . $this->temp_dir]);
             }
+
+            $batch_num = isset($_POST['batch']) ? intval($_POST['batch']) : 0;
+
+            // Calculate which items to process in this batch
+            $start_index = $batch_num * $this->batch_size;
+            $log_messages = [];
+            $errors = [];
+
+            // First, handle homepage in batch 0
+            if ($batch_num === 0) {
+                try {
+                    $homepage_result = $this->export_homepage();
+                    if ($homepage_result) {
+                        $log_messages[] = 'Homepage geexporteerd';
+                    } else {
+                        $errors[] = 'Homepage kon niet worden geexporteerd';
+                    }
+                } catch (Exception $e) {
+                    $errors[] = 'Homepage fout: ' . $e->getMessage();
+                }
+                $start_index = 0;
+            }
+
+            // Combine page and post IDs
+            $all_ids = array_merge(
+                array_map(function($id) { return ['type' => 'page', 'id' => $id]; }, $state['page_ids']),
+                array_map(function($id) { return ['type' => 'post', 'id' => $id]; }, $state['post_ids'])
+            );
+
+            // Adjust start index for homepage
+            $adjusted_start = ($batch_num === 0) ? 0 : ($start_index - 1);
+            $items_in_batch = array_slice($all_ids, $adjusted_start, $this->batch_size);
+
+            $pages_processed = 0;
+            $posts_processed = 0;
+            $failed_items = [];
+
+            foreach ($items_in_batch as $item) {
+                try {
+                    $post = get_post($item['id']);
+                    if (!$post) {
+                        $failed_items[] = "ID {$item['id']}: post niet gevonden";
+                        continue;
+                    }
+
+                    $result = $this->export_single_content($post);
+
+                    if ($result === false) {
+                        $failed_items[] = "'{$post->post_title}' (ID {$post->ID}): export mislukt";
+                    } else {
+                        if ($item['type'] === 'page') {
+                            $pages_processed++;
+                            $state['stats']['pages']++;
+                        } else {
+                            $posts_processed++;
+                            $state['stats']['posts']++;
+                        }
+                    }
+                } catch (Exception $e) {
+                    $failed_items[] = "ID {$item['id']}: " . $e->getMessage();
+                }
+            }
+
+            if ($pages_processed > 0) {
+                $log_messages[] = "{$pages_processed} pagina's geexporteerd";
+            }
+            if ($posts_processed > 0) {
+                $log_messages[] = "{$posts_processed} posts geexporteerd";
+            }
+            if (!empty($failed_items)) {
+                $log_messages[] = "⚠ " . count($failed_items) . " items overgeslagen";
+                foreach (array_slice($failed_items, 0, 3) as $fail) {
+                    $errors[] = $fail;
+                }
+                if (count($failed_items) > 3) {
+                    $errors[] = "... en " . (count($failed_items) - 3) . " meer";
+                }
+            }
+
+            // Update state
+            $state['current_batch'] = $batch_num + 1;
+            $state['processed'] += count($items_in_batch) + ($batch_num === 0 ? 1 : 0);
+            if (!isset($state['failed_count'])) {
+                $state['failed_count'] = 0;
+            }
+            $state['failed_count'] += count($failed_items);
+            update_option('export_only_state', $state);
+
+            // Check if more batches needed
+            $all_done = $state['current_batch'] >= $state['total_batches'];
+
+            wp_send_json_success([
+                'batch' => $batch_num,
+                'processed' => $state['processed'],
+                'total' => $state['total_items'],
+                'done' => $all_done,
+                'next_batch' => $all_done ? null : $batch_num + 1,
+                'log' => $log_messages,
+                'errors' => $errors,
+                'failed_count' => count($failed_items),
+                'stats' => $state['stats'],
+                'memory_used' => size_format(memory_get_usage(true)),
+                'memory_peak' => size_format(memory_get_peak_usage(true))
+            ]);
+
+        } catch (Exception $e) {
+            wp_send_json_error([
+                'message' => 'Batch fout: ' . $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'trace' => $e->getTraceAsString()
+            ]);
+        } catch (Error $e) {
+            wp_send_json_error([
+                'message' => 'PHP Error: ' . $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'trace' => $e->getTraceAsString()
+            ]);
         }
-
-        if ($pages_processed > 0) {
-            $log_messages[] = "{$pages_processed} pagina's geexporteerd";
-        }
-        if ($posts_processed > 0) {
-            $log_messages[] = "{$posts_processed} posts geexporteerd";
-        }
-
-        // Update state
-        $state['current_batch'] = $batch_num + 1;
-        $state['processed'] += count($items_in_batch) + ($batch_num === 0 ? 1 : 0);
-        update_option('export_only_state', $state);
-
-        // Check if more batches needed
-        $all_done = $state['current_batch'] >= $state['total_batches'];
-
-        wp_send_json_success([
-            'batch' => $batch_num,
-            'processed' => $state['processed'],
-            'total' => $state['total_items'],
-            'done' => $all_done,
-            'next_batch' => $all_done ? null : $batch_num + 1,
-            'log' => $log_messages,
-            'stats' => $state['stats']
-        ]);
     }
 
     /**
