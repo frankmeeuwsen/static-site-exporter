@@ -3,11 +3,18 @@
  * Plugin Name: Static Site Exporter to Kinsta
  * Plugin URI: https://github.com/mdubbelm/static-site-exporter
  * Description: Export WordPress site to static HTML and deploy to GitHub/Kinsta Static Hosting
- * Version: 2.5.3
+ * Version: 2.6.0
  * Author: Monique Dubbelman
  * License: GPL v2 or later
  *
  * Changelog:
+ * 2.6.0 - NEW FEATURE: Export Only ZIP Download
+ *       - Added new "Export Only" tab for standalone static site export
+ *       - Generate ZIP download without Git/GitHub/Kinsta deployment
+ *       - Automatic HTML transformations: remove search forms, comment forms, login elements
+ *       - Performance optimizations: HTML minification, lazy loading, preload hints
+ *       - Generate extra files: sitemap.xml, robots.txt, manifest.json, service worker, 404, offline page
+ *       - Images not included - paths made relative for local storage
  * 2.5.3 - BUGFIX: Fix git command not found error
  *       - Use full path to git binary (/usr/local/bin/git)
  *       - Fixes error code 127 when deploying via PHP exec()
@@ -61,6 +68,9 @@
 
 if (!defined('ABSPATH')) exit;
 
+// Include Export Only class
+require_once plugin_dir_path(__FILE__) . 'includes/class-static-export-only.php';
+
 class WP_Static_Exporter {
     // Configuration constants
     const BATCH_SIZE = 50;              // Files per GitHub batch (LEGACY - kept for backward compatibility)
@@ -82,6 +92,7 @@ class WP_Static_Exporter {
     private $export_dir;
     private $temp_dir;
     private $encryption_key;
+    private $export_only;
 
     public function __construct() {
         // Export directly to Git repository for seamless deployment
@@ -114,6 +125,9 @@ class WP_Static_Exporter {
 
         // Auto-export triggers
         $this->setup_auto_export_hooks();
+
+        // Initialize Export Only functionality
+        $this->export_only = new Static_Export_Only();
     }
 
     /**
@@ -267,8 +281,9 @@ class WP_Static_Exporter {
     public function enqueue_scripts($hook) {
         if ($hook !== 'toplevel_page_static-site-exporter') return;
 
-        wp_enqueue_style('static-exporter-css', plugin_dir_url(__FILE__) . 'assets/style.css', array(), '2.5.3');
-        wp_enqueue_script('static-exporter-js', plugin_dir_url(__FILE__) . 'assets/script.js', array('jquery'), '2.5.3', true);
+        wp_enqueue_style('static-exporter-css', plugin_dir_url(__FILE__) . 'assets/style.css', array(), '2.6.0');
+        wp_enqueue_script('static-exporter-js', plugin_dir_url(__FILE__) . 'assets/script.js', array('jquery'), '2.6.0', true);
+        wp_enqueue_script('static-exporter-export-only-js', plugin_dir_url(__FILE__) . 'assets/js/export-only.js', array('jquery'), '2.6.0', true);
         wp_localize_script('static-exporter-js', 'staticExporter', array(
             'ajax_url' => admin_url('admin-ajax.php'),
             'nonce' => wp_create_nonce('static_exporter_nonce')
@@ -281,9 +296,12 @@ class WP_Static_Exporter {
         // Get decrypted values for display validation (not shown in fields)
         $github_token = $this->decrypt($options['github_token_encrypted'] ?? '');
         $kinsta_api_key = $this->decrypt($options['kinsta_api_key_encrypted'] ?? '');
+
+        // Get active tab from URL or default to export-only
+        $active_tab = isset($_GET['tab']) ? sanitize_key($_GET['tab']) : 'export-only';
         ?>
         <div class="wrap">
-            <h1>Static Site Exporter to Kinsta</h1>
+            <h1>Static Site Exporter</h1>
 
             <?php
             // Display configuration status
@@ -294,7 +312,7 @@ class WP_Static_Exporter {
             $auto_export = $options['auto_export'] ?? false;
             $auto_deploy = $options['auto_deploy'] ?? false;
 
-            if ($auto_export): ?>
+            if ($auto_export && $active_tab === 'full-deploy'): ?>
             <div class="notice notice-success">
                 <p>
                     <strong>✓ Auto-Export is ENABLED</strong> - Your site will automatically export on content changes.
@@ -305,6 +323,27 @@ class WP_Static_Exporter {
             </div>
             <?php endif; ?>
 
+            <!-- Tab Navigation -->
+            <div class="exporter-tabs">
+                <a href="?page=static-site-exporter&tab=export-only"
+                   class="exporter-tab <?php echo $active_tab === 'export-only' ? 'active' : ''; ?>">
+                    <span class="dashicons dashicons-download"></span>
+                    Export Only (ZIP)
+                </a>
+                <a href="?page=static-site-exporter&tab=full-deploy"
+                   class="exporter-tab <?php echo $active_tab === 'full-deploy' ? 'active' : ''; ?>">
+                    <span class="dashicons dashicons-cloud-upload"></span>
+                    Full Deploy (Kinsta)
+                </a>
+            </div>
+
+            <!-- Tab Content: Export Only -->
+            <div class="exporter-tab-content <?php echo $active_tab === 'export-only' ? 'active' : ''; ?>">
+                <?php $this->export_only->render_tab(); ?>
+            </div>
+
+            <!-- Tab Content: Full Deploy -->
+            <div class="exporter-tab-content <?php echo $active_tab === 'full-deploy' ? 'active' : ''; ?>">
             <div class="static-exporter-container">
                 <div class="exporter-section">
                     <h2>GitHub Settings</h2>
@@ -498,6 +537,7 @@ class WP_Static_Exporter {
                     </div>
                 </div>
             </div>
+            </div><!-- End Full Deploy tab content -->
         </div>
         <?php
     }

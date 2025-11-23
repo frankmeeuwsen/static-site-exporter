@@ -114,8 +114,279 @@
     .export-actions {
         flex-direction: column;
     }
-    
+
     .export-actions .button {
         width: 100%;
+    }
+}
+
+/* ==========================================================================
+   Export Only Tab Styles
+   ========================================================================== */
+
+/* Tab Navigation */
+.exporter-tabs {
+    display: flex;
+    gap: 0;
+    margin-bottom: 0;
+    border-bottom: 1px solid #ccd0d4;
+    background: #fff;
+}
+
+.exporter-tab {
+    padding: 12px 24px;
+    background: #f0f0f1;
+    border: 1px solid #ccd0d4;
+    border-bottom: none;
+    margin-bottom: -1px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+    color: #50575e;
+    transition: all 0.2s ease;
+}
+
+.exporter-tab:first-child {
+    border-radius: 4px 0 0 0;
+}
+
+.exporter-tab:last-child {
+    border-radius: 0 4px 0 0;
+}
+
+.exporter-tab:hover {
+    background: #fff;
+    color: #1d2327;
+}
+
+.exporter-tab.active {
+    background: #fff;
+    border-bottom-color: #fff;
+    color: #1d2327;
+}
+
+.exporter-tab .dashicons {
+    margin-right: 6px;
+    vertical-align: middle;
+}
+
+/* Tab Content */
+.exporter-tab-content {
+    display: none;
+    background: #fff;
+    padding: 20px;
+    border: 1px solid #ccd0d4;
+    border-top: none;
+}
+
+.exporter-tab-content.active {
+    display: block;
+}
+
+/* Export Only Container */
+.export-only-container {
+    max-width: 800px;
+}
+
+.export-only-header {
+    margin-bottom: 25px;
+}
+
+.export-only-header h2 {
+    margin: 0 0 10px 0;
+    font-size: 1.5em;
+    color: #1d2327;
+}
+
+.export-only-header .description {
+    color: #646970;
+    line-height: 1.6;
+}
+
+/* Info Table */
+.export-only-info {
+    margin-bottom: 25px;
+}
+
+.export-only-info table {
+    border-collapse: collapse;
+}
+
+.export-only-info td {
+    padding: 12px 15px;
+    vertical-align: top;
+}
+
+.export-only-info td:first-child {
+    width: 200px;
+    color: #1d2327;
+}
+
+.export-only-info .text-muted {
+    color: #888;
+}
+
+/* Actions */
+.export-only-actions {
+    display: flex;
+    gap: 15px;
+    margin-bottom: 25px;
+}
+
+.export-only-actions .button-hero {
+    padding: 12px 30px;
+    height: auto;
+    line-height: 1.5;
+    font-size: 16px;
+}
+
+.export-only-actions .button-hero .dashicons {
+    font-size: 20px;
+    width: 20px;
+    height: 20px;
+    margin-right: 8px;
+    vertical-align: middle;
+}
+
+/* Progress */
+.export-only-progress {
+    margin-bottom: 25px;
+}
+
+.export-only-progress .progress-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+}
+
+.export-only-progress .progress-bar-container {
+    flex: 1;
+    background: #f0f0f1;
+    border-radius: 4px;
+    height: 24px;
+    overflow: hidden;
+}
+
+.export-only-progress .progress-bar {
+    height: 100%;
+    background: linear-gradient(90deg, #2271b1, #135e96);
+    transition: width 0.3s ease;
+    border-radius: 4px;
+}
+
+.export-only-progress .progress-text {
+    min-width: 120px;
+    font-weight: 500;
+    color: #1d2327;
+}
+
+/* Log */
+.export-only-log {
+    background: #1e1e1e;
+    color: #d4d4d4;
+    padding: 15px;
+    border-radius: 4px;
+    font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Code', monospace;
+    font-size: 13px;
+    max-height: 300px;
+    overflow-y: auto;
+    margin-bottom: 25px;
+}
+
+.export-only-log:empty {
+    display: none;
+}
+
+.export-only-log .log-entry {
+    padding: 3px 0;
+    border-bottom: 1px solid #333;
+}
+
+.export-only-log .log-entry:last-child {
+    border-bottom: none;
+}
+
+.export-only-log .log-success {
+    color: #4ec9b0;
+}
+
+.export-only-log .log-error {
+    color: #f14c4c;
+}
+
+.export-only-log .log-info {
+    color: #9cdcfe;
+}
+
+/* Statistics */
+.export-only-stats {
+    background: #f8f9fa;
+    border: 1px solid #e2e4e7;
+    border-radius: 4px;
+    padding: 20px;
+}
+
+.export-only-stats h3 {
+    margin: 0 0 15px 0;
+    font-size: 14px;
+    color: #1d2327;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.export-only-stats .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 20px;
+}
+
+.export-only-stats .stat-item {
+    text-align: center;
+    padding: 15px;
+    background: #fff;
+    border-radius: 4px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+
+.export-only-stats .stat-value {
+    display: block;
+    font-size: 28px;
+    font-weight: 600;
+    color: #2271b1;
+    margin-bottom: 5px;
+}
+
+.export-only-stats .stat-label {
+    display: block;
+    font-size: 12px;
+    color: #646970;
+    text-transform: uppercase;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .exporter-tabs {
+        flex-direction: column;
+    }
+
+    .exporter-tab {
+        border-radius: 0;
+    }
+
+    .exporter-tab:first-child {
+        border-radius: 4px 4px 0 0;
+    }
+
+    .export-only-actions {
+        flex-direction: column;
+    }
+
+    .export-only-actions .button-hero {
+        width: 100%;
+        text-align: center;
+    }
+
+    .export-only-stats .stats-grid {
+        grid-template-columns: repeat(2, 1fr);
     }
 }
